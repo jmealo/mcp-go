@@ -53,6 +53,10 @@ type taskEntry struct {
 	// inputRequests holds the pending input requests the task is waiting on
 	// when it is in the input_required state.
 	inputRequests mcp.InputRequests
+	// deliveredInputKeys records every inputRequests key surfaced to the
+	// client over this task's lifetime (SEP-2663: a key MUST be unique over
+	// the lifetime of a single task). Guarded by tasksMu.
+	deliveredInputKeys map[string]struct{}
 	// createdHookDone, under tasksMu, says the created hook has returned;
 	// until then the hook of a completion or cancellation waits in
 	// pendingHooks, which createTask runs after the created hook. A task's
@@ -2801,6 +2805,11 @@ func (s *MCPServer) executeRegularToolAsTask(
 // awaitTaskInput parks a task in input_required, publishing requests for the
 // client to answer via tasks/update, and blocks until all answers arrive or the
 // task is cancelled/expired (taskCtx done).
+//
+// A request key that was already surfaced earlier in the task's lifetime fails
+// the task: SEP-2663 requires each inputRequests key to be unique over the
+// lifetime of a single task, because clients deduplicate by key and would
+// silently drop a re-issued request.
 func (s *MCPServer) awaitTaskInput(
 	taskCtx context.Context,
 	entry *taskEntry,
@@ -2810,6 +2819,21 @@ func (s *MCPServer) awaitTaskInput(
 	if entry.completed {
 		s.tasksMu.Unlock()
 		return nil, false
+	}
+	for key := range requests {
+		if _, delivered := entry.deliveredInputKeys[key]; delivered {
+			s.tasksMu.Unlock()
+			s.completeTask(entry, nil, fmt.Errorf(
+				"tool %q re-issued input request key %q; inputRequests keys must be unique over a task's lifetime",
+				entry.toolName, key))
+			return nil, false
+		}
+	}
+	if entry.deliveredInputKeys == nil {
+		entry.deliveredInputKeys = make(map[string]struct{}, len(requests))
+	}
+	for key := range requests {
+		entry.deliveredInputKeys[key] = struct{}{}
 	}
 	entry.task.Status = mcp.TaskStatusInputRequired
 	entry.task.LastUpdatedAt = time.Now().UTC().Format(time.RFC3339)
@@ -2994,11 +3018,13 @@ func (s *MCPServer) handleUpdateTask(
 	s.tasksMu.Lock()
 	if status := entry.task.Status; status != mcp.TaskStatusInputRequired {
 		s.tasksMu.Unlock()
-		return nil, &requestError{
-			id:   id,
-			code: mcp.INVALID_PARAMS,
-			err:  fmt.Errorf("task %q is not awaiting input (status: %s)", request.Params.TaskId, status),
-		}
+		// Every response is non-outstanding by definition, and SEP-2663 says
+		// a server SHOULD ignore those. Ack idempotently: a retried update
+		// whose ack was lost must not error, and cancellation lets the client
+		// stop polling without a follow-up update failing.
+		result := &mcp.UpdateTaskResult{}
+		result.SetResultType(mcp.ResultTypeComplete)
+		return result, nil
 	}
 	if entry.inputResponses == nil {
 		entry.inputResponses = make(mcp.InputResponses)

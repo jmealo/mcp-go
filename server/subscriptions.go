@@ -67,6 +67,25 @@ func (s *MCPServer) handleSubscriptionsListen(
 		}
 	}
 
+	// Requesting task status notifications requires the tasks extension to be
+	// declared on the request (SEP-2663): "If a client requests task status
+	// notifications but does not declare the io.modelcontextprotocol/tasks
+	// extension capability, the server MUST return a JSON-RPC error specifying
+	// the missing capabilities." This server does not push notifications/tasks
+	// — clients poll tasks/get — but the capability gate applies regardless.
+	if len(request.Params.Notifications.TaskIds) > 0 {
+		info := RequestProtocolInfoFromContext(ctx)
+		if info == nil || info.ClientCapabilities == nil ||
+			!info.ClientCapabilities.HasExtension(mcp.ExtensionTasks) {
+			return nil, &requestError{
+				id:   id,
+				code: mcp.MISSING_REQUIRED_CLIENT_CAPABILITY,
+				err:  fmt.Errorf("task status notifications require the %s extension", mcp.ExtensionTasks),
+				data: missingExtensionData(mcp.ExtensionTasks),
+			}
+		}
+	}
+
 	session := ClientSessionFromContext(ctx)
 	if session == nil {
 		return nil, &requestError{
