@@ -178,7 +178,10 @@ func TestAwaitTaskInput_DistinctKeysAcrossRoundsSucceed(t *testing.T) {
 	for i, key := range []string{"q1", "q2"} {
 		require.Eventually(t, func() bool {
 			got, e := srv.handleGetTask(ctx, 2, mcp.GetTaskRequest{Params: mcp.GetTaskParams{TaskId: taskID}})
-			return e == nil && got.Status == mcp.TaskStatusInputRequired && got.InputRequests != nil
+			// Wait for this round's request: right after the previous answer the
+			// task is still input_required with an empty request map.
+			_, asked := got.InputRequests[key]
+			return e == nil && got.Status == mcp.TaskStatusInputRequired && asked
 		}, 5*time.Second, 10*time.Millisecond, "waiting to answer %s", key)
 
 		got, reqErr := srv.handleGetTask(ctx, 2, mcp.GetTaskRequest{Params: mcp.GetTaskParams{TaskId: taskID}})
