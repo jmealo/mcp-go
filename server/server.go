@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -64,7 +65,23 @@ type taskEntry struct {
 	// that cancels its own task does not wait for itself.
 	createdHookDone bool
 	pendingHooks    []func()
+
+	// Durable fields, written to the TaskStore (see task_store.go).
+	protocol    *RequestProtocolInfo
+	request     json.RawMessage
+	expiresAt   *time.Time
+	resumeState json.RawMessage
+	// remote marks an entry read from the TaskStore for a task this process
+	// does not run; it is never put in s.tasks.
+	remote bool
+	// storeMu serializes this entry's store writes; revision is the stored
+	// record's revision they compare against.
+	storeMu  sync.Mutex
+	revision atomic.Uint64
 }
+
+func (e *taskEntry) loadRevision() uint64   { return e.revision.Load() }
+func (e *taskEntry) storeRevision(r uint64) { e.revision.Store(r) }
 
 // ServerOption is a function that configures an MCPServer.
 type ServerOption func(*MCPServer)
@@ -277,6 +294,7 @@ type MCPServer struct {
 	hooks                        *Hooks
 	taskHooks                    *TaskHooks
 	tasks                        map[string]*taskEntry
+	taskStore                    TaskStore            // nil: tasks live only in this process
 	expiredTasks                 map[string]time.Time // Tracks recently expired task IDs with expiration timestamp
 	maxConcurrentTasks           *int                 // Optional limit on concurrent running tasks
 	defaultTaskTTLMs             *int64               // Fallback TTL applied when client supplies none
@@ -2538,7 +2556,7 @@ func (s *MCPServer) handleTaskAugmentedToolCall(
 	}
 
 	// Create task entry (pollInterval is nil - server doesn't set a default)
-	entry, err := s.createTask(ctx, taskID, request.Params.Name, ttl, nil)
+	entry, err := s.createTaskFor(ctx, taskID, request.Params.Name, ttl, nil, &request)
 	if err != nil {
 		return nil, &requestError{
 			id:   id,
@@ -2596,6 +2614,7 @@ func (s *MCPServer) executeTaskTool(
 		context.WithoutCancel(ctx),
 	)
 	defer cancel()
+	taskCtx = withTaskHandle(taskCtx, s, entry)
 
 	// Register cancellation atomically with TTL cleanup, which may have
 	// already removed the task, and with tasks/cancel, which may have ended
@@ -2698,6 +2717,7 @@ func (s *MCPServer) executeRegularToolAsTask(
 		context.WithoutCancel(ctx),
 	)
 	defer cancel()
+	taskCtx = withTaskHandle(taskCtx, s, entry)
 
 	// Register cancellation atomically with TTL cleanup, which may have
 	// already removed the task, and with tasks/cancel, which may have ended
@@ -2848,6 +2868,9 @@ func (s *MCPServer) awaitTaskInput(
 	task := entry.task
 	s.tasksMu.Unlock()
 
+	if errors.Is(s.persistLocalState(taskCtx, entry), ErrTaskTerminal) {
+		return nil, false
+	}
 	s.sendTaskStatusNotification(task, entry.modernTask)
 
 	select {
@@ -2869,6 +2892,9 @@ func (s *MCPServer) awaitTaskInput(
 	task = entry.task
 	s.tasksMu.Unlock()
 
+	if errors.Is(s.persistLocalState(taskCtx, entry), ErrTaskTerminal) {
+		return nil, false
+	}
 	s.sendTaskStatusNotification(task, entry.modernTask)
 	return responses, true
 }
@@ -3014,6 +3040,14 @@ func (s *MCPServer) handleUpdateTask(
 		}
 	}
 
+	if entry.remote && entry.task.Status == mcp.TaskStatusInputRequired {
+		return nil, &requestError{
+			id:   id,
+			code: mcp.INTERNAL_ERROR,
+			err:  fmt.Errorf("task %q is awaiting input on another server instance", request.Params.TaskId),
+		}
+	}
+
 	// Accumulate answers while retaining outstanding inputs.
 	s.tasksMu.Lock()
 	if status := entry.task.Status; status != mcp.TaskStatusInputRequired {
@@ -3061,7 +3095,10 @@ func (s *MCPServer) handleListTasks(
 	id any,
 	request mcp.ListTasksRequest,
 ) (*mcp.ListTasksResult, *requestError) {
-	tasks := s.listTasks(ctx)
+	tasks, err := s.listTasksChecked(ctx)
+	if err != nil {
+		return nil, &requestError{id: id, code: mcp.INTERNAL_ERROR, err: err}
+	}
 
 	// Sort tasks by TaskId for consistent pagination
 	sort.Slice(tasks, func(i, j int) bool {
@@ -3104,6 +3141,23 @@ func (s *MCPServer) handleTaskResult(
 			id:   id,
 			code: mcp.INVALID_PARAMS,
 			err:  err,
+		}
+	}
+
+	// A task another process runs: wait on the store, not on a local channel.
+	if !task.Status.IsTerminal() && s.taskStore != nil {
+		s.tasksMu.RLock()
+		_, local := s.tasks[request.Params.TaskId]
+		s.tasksMu.RUnlock()
+		if !local {
+			if err := s.waitStoredTerminal(ctx, request.Params.TaskId); err != nil {
+				code := mcp.INVALID_PARAMS
+				if ctx.Err() != nil {
+					code = mcp.REQUEST_INTERRUPTED
+				}
+				return nil, &requestError{id: id, code: code, err: err}
+			}
+			task.Status = mcp.TaskStatusCompleted // terminal; the entry is re-read below
 		}
 	}
 
@@ -3293,6 +3347,13 @@ func (s *MCPServer) handleComplete(
 // createTask creates a new task entry and returns it.
 // Returns an error if the max concurrent tasks limit is exceeded.
 func (s *MCPServer) createTask(ctx context.Context, taskID string, toolName string, ttl *int64, pollInterval *int64) (*taskEntry, error) {
+	return s.createTaskFor(ctx, taskID, toolName, ttl, pollInterval, nil)
+}
+
+// createTaskFor creates a task for request (nil when there is none to
+// resume, as in tests). With a TaskStore the record is created there before
+// the task is reported; a store failure fails the creation.
+func (s *MCPServer) createTaskFor(ctx context.Context, taskID string, toolName string, ttl *int64, pollInterval *int64, request *mcp.CallToolRequest) (*taskEntry, error) {
 	// Build task entry first (no lock needed)
 	opts := []mcp.TaskOption{}
 	if ttl != nil {
@@ -3313,6 +3374,21 @@ func (s *MCPServer) createTask(ctx context.Context, taskID string, toolName stri
 		done:       make(chan struct{}),
 		inputReady: make(chan struct{}, 1),
 	}
+	if info := RequestProtocolInfoFromContext(ctx); info != nil {
+		p := *info
+		entry.protocol = &p
+	}
+	if ttl != nil && *ttl > 0 {
+		exp := createdAt.Add(time.Duration(*ttl) * time.Millisecond)
+		entry.expiresAt = &exp
+	}
+	if s.taskStore != nil && request != nil {
+		raw, err := json.Marshal(request)
+		if err != nil {
+			return nil, fmt.Errorf("task request cannot be stored: %w", err)
+		}
+		entry.request = raw
+	}
 
 	// Single critical section for check + increment + insert
 	s.tasksMu.Lock()
@@ -3330,7 +3406,23 @@ func (s *MCPServer) createTask(ctx context.Context, taskID string, toolName stri
 	s.tasks[taskID] = entry
 	// With no hooks there is nothing to wait for.
 	entry.createdHookDone = s.taskHooks == nil
+	rec := s.recordFromEntryLocked(entry)
 	s.tasksMu.Unlock()
+
+	// The task exists once the store has it; a failure undoes the local insert.
+	if s.taskStore != nil {
+		stored, err := s.taskStore.Create(context.WithoutCancel(ctx), rec)
+		if err != nil {
+			s.tasksMu.Lock()
+			if s.tasks[taskID] == entry {
+				delete(s.tasks, taskID)
+				s.activeTasks--
+			}
+			s.tasksMu.Unlock()
+			return nil, fmt.Errorf("task store: %w", err)
+		}
+		entry.storeRevision(stored.Revision)
+	}
 
 	// Fire task created hook, outside the lock: a hook may take time, or
 	// read task state through the server.
@@ -3399,7 +3491,15 @@ func (s *MCPServer) getTask(ctx context.Context, taskID string) (mcp.Task, chan 
 			return mcp.Task{}, nil, fmt.Errorf("task has expired")
 		}
 		s.tasksMu.RUnlock()
-		return mcp.Task{}, nil, fmt.Errorf("task not found")
+		if s.taskStore == nil {
+			return mcp.Task{}, nil, fmt.Errorf("task not found")
+		}
+		stored, err := s.loadStoredEntry(ctx, taskID)
+		if err != nil {
+			return mcp.Task{}, nil, err
+		}
+		entry = stored
+		s.tasksMu.RLock()
 	}
 
 	// Cross-origin isolation, a request must not reach a task created under a
@@ -3434,9 +3534,17 @@ func (s *MCPServer) getTaskEntry(ctx context.Context, taskID string) (*taskEntry
 			return nil, fmt.Errorf("task has expired")
 		}
 		s.tasksMu.RUnlock()
-		return nil, fmt.Errorf("task not found")
+		if s.taskStore == nil {
+			return nil, fmt.Errorf("task not found")
+		}
+		stored, err := s.loadStoredEntry(ctx, taskID)
+		if err != nil {
+			return nil, err
+		}
+		entry = stored
+	} else {
+		s.tasksMu.RUnlock()
 	}
-	s.tasksMu.RUnlock()
 
 	// Cross-origin isolation. A legacy request must not reach a
 	// modern-origin task or vice versa.
@@ -3453,10 +3561,32 @@ func (s *MCPServer) getTaskEntry(ctx context.Context, taskID string) (*taskEntry
 	return entry, nil
 }
 
-// listTasks returns copies of all tasks for the current session.
+// listTasks returns copies of all tasks for the current session; a store
+// error yields none (handlers use listTasksChecked to report it).
 func (s *MCPServer) listTasks(ctx context.Context) []mcp.Task {
+	tasks, _ := s.listTasksChecked(ctx)
+	return tasks
+}
+
+// listTasksChecked lists the session's tasks. With a TaskStore the store is
+// the authority, so tasks of other servers are listed too.
+func (s *MCPServer) listTasksChecked(ctx context.Context) ([]mcp.Task, error) {
 	modern := IsModernRequest(ctx)
 	sessionID := getSessionID(ctx)
+
+	if s.taskStore != nil {
+		recs, err := s.taskStore.ListBySession(ctx, sessionID)
+		if err != nil {
+			return nil, fmt.Errorf("task store: %w", err)
+		}
+		var tasks []mcp.Task
+		for _, rec := range recs {
+			if rec.Modern == modern {
+				tasks = append(tasks, rec.Task)
+			}
+		}
+		return tasks, nil
+	}
 
 	s.tasksMu.RLock()
 	defer s.tasksMu.RUnlock()
@@ -3474,11 +3604,79 @@ func (s *MCPServer) listTasks(ctx context.Context) []mcp.Task {
 		}
 	}
 
-	return tasks
+	return tasks, nil
 }
 
-// completeTask marks a task as completed with the given result.
+// completeTask marks a task as completed with the given result. With a
+// TaskStore the outcome is stored first: a store that already holds a
+// terminal state wins, and a result that cannot be stored fails the task.
 func (s *MCPServer) completeTask(entry *taskEntry, result any, err error) {
+	if s.taskStore != nil && !entry.remote {
+		var adopted bool
+		result, err, adopted = s.storeCompletion(entry, result, err)
+		if adopted {
+			return
+		}
+	}
+	s.commitComplete(entry, result, err)
+}
+
+func applyTerminal(rec *TaskRecord, status mcp.TaskStatus, message string, at time.Time) {
+	rec.Task.Status = status
+	rec.Task.StatusMessage = message
+	rec.Task.LastUpdatedAt = at.UTC().Format(time.RFC3339)
+}
+
+// storeCompletion writes the task's outcome; it returns the outcome to commit
+// locally, or adopted when another writer's terminal state was taken instead.
+func (s *MCPServer) storeCompletion(entry *taskEntry, result any, err error) (any, error, bool) {
+	s.tasksMu.RLock()
+	if entry.completed {
+		s.tasksMu.RUnlock()
+		return result, err, false
+	}
+	rec := s.recordFromEntryLocked(entry)
+	s.tasksMu.RUnlock()
+
+	build := func(result any, err error) (TaskRecord, any, error) {
+		r := rec
+		if err == nil {
+			raw, mErr := json.Marshal(result)
+			if mErr != nil {
+				result, err = nil, fmt.Errorf("task result could not be stored: %w", mErr)
+			} else {
+				r.Result = raw
+			}
+		}
+		if err != nil {
+			applyTerminal(&r, mcp.TaskStatusFailed, err.Error(), time.Now())
+			r.Error = recordError(err)
+		} else {
+			applyTerminal(&r, mcp.TaskStatusCompleted, "", time.Now())
+		}
+		return r, result, err
+	}
+	r, result, err := build(result, err)
+	stored, pErr := s.storeUpdate(context.Background(), entry, r)
+	if errors.Is(pErr, ErrTaskTerminal) {
+		s.adoptTerminal(context.Background(), entry, stored)
+		return nil, nil, true
+	}
+	if pErr != nil && err == nil {
+		// The result is not durable, so it is not reported: fail the task.
+		s.logTaskStore("task store: result not saved; failing the task", "task", rec.Task.TaskId, "error", pErr)
+		r, result, err = build(nil, fmt.Errorf("task result could not be stored: %w", pErr))
+		if _, fErr := s.storeUpdate(context.Background(), entry, r); fErr != nil {
+			s.logTaskStore("task store: failure not saved", "task", rec.Task.TaskId, "error", fErr)
+		}
+	} else if pErr != nil {
+		s.logTaskStore("task store: failure not saved", "task", rec.Task.TaskId, "error", pErr)
+	}
+	return result, err, false
+}
+
+// commitComplete records the outcome in memory and signals waiters.
+func (s *MCPServer) commitComplete(entry *taskEntry, result any, err error) {
 	s.tasksMu.Lock()
 
 	// Guard against double completion
@@ -3544,22 +3742,65 @@ func (s *MCPServer) cancelTask(ctx context.Context, taskID string, rejectTermina
 	if err != nil {
 		return err
 	}
-	return s.cancelTaskEntry(ctx, entry, "Task cancelled by request", rejectTerminal)
+	return s.cancelEntry(ctx, entry, "Task cancelled by request", rejectTerminal, true)
 }
 
 // cancelTaskEntry records a cancellation and invokes observers after unlocking.
 func (s *MCPServer) cancelTaskEntry(ctx context.Context, entry *taskEntry, message string, rejectTerminal bool) error {
-	s.tasksMu.Lock()
+	return s.cancelEntry(ctx, entry, message, rejectTerminal, false)
+}
 
-	// Already terminal. legacy (rejectTerminal) returns INVALID_PARAMS, modern acks.
-	// Checked under the lock so a just-completed entry isn't raced.
-	if entry.completed {
-		status := entry.task.Status
-		s.tasksMu.Unlock()
+// cancelEntry cancels entry. With a TaskStore the cancellation is stored
+// first; a terminal state stored by another writer wins. requested (a client's
+// tasks/cancel) returns a store failure instead of reporting an unsaved
+// cancel; internal callers, whose work has already stopped, commit anyway.
+func (s *MCPServer) cancelEntry(ctx context.Context, entry *taskEntry, message string, rejectTerminal, requested bool) error {
+	terminal := func(status mcp.TaskStatus) error {
 		if rejectTerminal {
 			return fmt.Errorf("cannot cancel task in terminal status: %s", status)
 		}
 		return nil
+	}
+	if s.taskStore != nil {
+		s.tasksMu.RLock()
+		completed, status := entry.completed, entry.task.Status
+		rec := s.recordFromEntryLocked(entry)
+		s.tasksMu.RUnlock()
+		if completed {
+			return terminal(status)
+		}
+		applyTerminal(&rec, mcp.TaskStatusCancelled, message, time.Now())
+		rec.Error = recordError(context.Canceled)
+		stored, err := s.storeUpdate(ctx, entry, rec)
+		switch {
+		case errors.Is(err, ErrTaskTerminal):
+			if !entry.remote {
+				s.adoptTerminal(ctx, entry, stored)
+			}
+			return terminal(stored.Task.Status)
+		case err != nil && requested:
+			return fmt.Errorf("task store: cancellation not saved: %w", err)
+		case err != nil:
+			s.logTaskStore("task store: cancellation not saved", "task", rec.Task.TaskId, "error", err)
+		}
+		if entry.remote {
+			// Stored; the process running the task finds it terminal on its next write.
+			return nil
+		}
+	}
+	if committed, status := s.commitCancel(ctx, entry, message); !committed {
+		return terminal(status)
+	}
+	return nil
+}
+
+// commitCancel records a cancellation in memory; false if already terminal.
+func (s *MCPServer) commitCancel(ctx context.Context, entry *taskEntry, message string) (bool, mcp.TaskStatus) {
+	s.tasksMu.Lock()
+	if entry.completed {
+		status := entry.task.Status
+		s.tasksMu.Unlock()
+		return false, status
 	}
 	cancel := entry.cancelFunc
 	cancelledAt := time.Now()
@@ -3590,7 +3831,7 @@ func (s *MCPServer) cancelTaskEntry(ctx context.Context, entry *taskEntry, messa
 		// After the created hook, if it is still running.
 		s.fireTaskHook(ctx, entry, func(ctx context.Context) { s.taskHooks.taskCancelled(ctx, metrics) })
 	}
-	return nil
+	return true, mcp.TaskStatusCancelled
 }
 
 // scheduleTaskCleanup cancels unfinished task execution and removes the task from
@@ -3615,6 +3856,11 @@ func (s *MCPServer) scheduleTaskCleanup(taskID string, expected *taskEntry, ttlM
 
 	if cancel != nil {
 		cancel()
+	}
+	if s.taskStore != nil {
+		if err := s.taskStore.Delete(context.Background(), taskID); err != nil {
+			s.logTaskStore("task store: expired task not deleted", "task", taskID, "error", err)
+		}
 	}
 
 	// Remove tombstone after 5 minutes.

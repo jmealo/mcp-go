@@ -83,6 +83,11 @@ func handlerError(ctx context.Context, id any, err error) *requestError {
 // client-facing message, and data an exposed handler error would carry on the
 // synchronous path, rather than flattening everything to INTERNAL_ERROR.
 func taskErrorDetails(err error) *mcp.JSONRPCErrorDetails {
+	var stored *storedTaskError
+	if errors.As(err, &stored) {
+		details := stored.details
+		return &details
+	}
 	if _, ok := asURLElicitationRequired(err); ok {
 		return &mcp.JSONRPCErrorDetails{
 			Code:    mcp.INTERNAL_ERROR,
