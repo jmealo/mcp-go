@@ -570,7 +570,8 @@ func TestTaskCrossOriginIsolation(t *testing.T) {
 	assert.NoError(t, err, "modern caller must access its own task")
 
 	// Legacy tasks/list must enumerate only legacy-origin tasks.
-	listed := srv.listTasks(legacyCtx)
+	listed, err := srv.listTasks(legacyCtx)
+	require.NoError(t, err)
 	var ids []string
 	for _, tk := range listed {
 		ids = append(ids, tk.TaskId)

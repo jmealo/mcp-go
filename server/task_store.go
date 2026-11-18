@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"slices"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/mark3labs/mcp-go/mcp"
 )
@@ -50,9 +53,13 @@ type TaskRecord struct {
 	ExpiresAt *time.Time `json:"expiresAt,omitempty"`
 	// ResumeState is opaque handler state set with SetTaskResumeState.
 	ResumeState json.RawMessage `json:"resumeState,omitempty"`
+	// InputRequests are the requests an input_required task waits on.
+	InputRequests mcp.InputRequests `json:"inputRequests,omitempty"`
 	// DeliveredInputKeys are the inputRequests keys surfaced so far; SEP-2663
 	// requires them unique over the task's lifetime.
 	DeliveredInputKeys []string `json:"deliveredInputKeys,omitempty"`
+	// Owner identifies the server that last created or claimed the task.
+	Owner string `json:"owner,omitempty"`
 	// Revision is set by the store: 1 on Create, +1 on each Update. Update
 	// succeeds only when the caller's Revision equals the stored one.
 	Revision uint64 `json:"revision"`
@@ -85,15 +92,28 @@ type TaskStore interface {
 	ListBySession(ctx context.Context, sessionID string) ([]TaskRecord, error)
 	// ListNonTerminal returns every unexpired record not in a terminal status.
 	ListNonTerminal(ctx context.Context) ([]TaskRecord, error)
+	// DeleteExpired deletes every record whose ExpiresAt is not after now and
+	// returns how many it deleted.
+	DeleteExpired(ctx context.Context, now time.Time) (int, error)
 }
 
 // WithTaskStore makes tasks durable in store: the server writes every task
 // state change there before it reports it, serves tasks it does not run from
 // there, and can resume unfinished tasks with ResumeTasks. Without it, tasks
 // live only in this process.
+//
+// Task records keep the creating session's ID, and a task is only visible to
+// that session (or to requests without one). After a restart, a stateful
+// client that comes back with a new session ID cannot reach its tasks;
+// keep session IDs stable across restarts (a persistent SessionIdManager)
+// or use stateless requests.
 func WithTaskStore(store TaskStore) ServerOption {
 	return func(s *MCPServer) {
 		s.taskStore = store
+		s.taskOwner = uuid.NewString()
+		s.taskStoreRetryMin = 100 * time.Millisecond
+		s.taskStoreRetryMax = 30 * time.Second
+		s.taskPurgeInterval = time.Minute
 	}
 }
 
@@ -120,6 +140,7 @@ func cloneRecord(rec TaskRecord) TaskRecord {
 	rec.Result = slices.Clone(rec.Result)
 	rec.ResumeState = slices.Clone(rec.ResumeState)
 	rec.DeliveredInputKeys = slices.Clone(rec.DeliveredInputKeys)
+	rec.InputRequests = maps.Clone(rec.InputRequests)
 	if rec.Error != nil {
 		e := *rec.Error
 		rec.Error = &e
@@ -204,6 +225,19 @@ func (m *MemoryTaskStore) ListBySession(_ context.Context, sessionID string) ([]
 		}
 	}
 	return out, nil
+}
+
+func (m *MemoryTaskStore) DeleteExpired(_ context.Context, now time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for id, rec := range m.records {
+		if rec.ExpiresAt != nil && !now.Before(*rec.ExpiresAt) {
+			delete(m.records, id)
+			n++
+		}
+	}
+	return n, nil
 }
 
 func (m *MemoryTaskStore) ListNonTerminal(_ context.Context) ([]TaskRecord, error) {

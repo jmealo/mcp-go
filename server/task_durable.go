@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"time"
 
@@ -37,6 +38,21 @@ func recordError(err error) *TaskRecordError {
 		return &TaskRecordError{Details: stored.details, Cancelled: stored.cancelled}
 	}
 	return &TaskRecordError{Details: *taskErrorDetails(err), Cancelled: errors.Is(err, context.Canceled)}
+}
+
+// errTaskOwnershipLost: the stored record moved on (a newer revision, not
+// terminal) without this process: another server resumed the task.
+var errTaskOwnershipLost = errors.New("task ownership lost: another server resumed it")
+
+// errTaskStoreFailure wraps store errors other than the sentinels, so request
+// handlers answer INTERNAL_ERROR rather than INVALID_PARAMS.
+var errTaskStoreFailure = errors.New("task store")
+
+func storeFailure(err error) error { return fmt.Errorf("%w: %w", errTaskStoreFailure, err) }
+
+// recordGone: the record was deleted or expired (normally by TTL cleanup).
+func recordGone(err error) bool {
+	return errors.Is(err, ErrTaskNotFound) || errors.Is(err, ErrTaskExpired)
 }
 
 // taskHandle ties a running handler's context to its task.
@@ -77,10 +93,11 @@ func TaskResumeStateFromContext(ctx context.Context) json.RawMessage {
 }
 
 // SetTaskResumeState records opaque state for resuming the task after a
-// restart, and writes it to the TaskStore before returning. If the task has
-// meanwhile ended in the store (for example cancelled by another server),
-// the handler's context is cancelled and ErrTaskTerminal returned. Without a
-// TaskStore the state is kept in memory only.
+// restart, and writes it to the TaskStore before returning. ErrTaskTerminal
+// if the task has ended in the store (for example cancelled elsewhere), or
+// an ownership error if another server resumed it; in both cases the
+// handler's context is cancelled. Without a TaskStore the state is kept in
+// memory only.
 func SetTaskResumeState(ctx context.Context, state json.RawMessage) error {
 	h, ok := ctx.Value(taskHandleKey{}).(*taskHandle)
 	if !ok {
@@ -88,7 +105,7 @@ func SetTaskResumeState(ctx context.Context, state json.RawMessage) error {
 	}
 	s, entry := h.server, h.entry
 	s.tasksMu.Lock()
-	if entry.completed {
+	if entry.completed || entry.dropped {
 		s.tasksMu.Unlock()
 		return ErrTaskTerminal
 	}
@@ -112,6 +129,10 @@ func (s *MCPServer) recordFromEntryLocked(entry *taskEntry) TaskRecord {
 		keys = append(keys, k)
 	}
 	slices.Sort(keys)
+	owner := entry.owner
+	if !entry.remote {
+		owner = s.taskOwner
+	}
 	return cloneRecord(TaskRecord{
 		Task:               entry.task,
 		SessionID:          entry.sessionID,
@@ -122,21 +143,31 @@ func (s *MCPServer) recordFromEntryLocked(entry *taskEntry) TaskRecord {
 		Request:            entry.request,
 		ExpiresAt:          entry.expiresAt,
 		ResumeState:        entry.resumeState,
+		InputRequests:      maps.Clone(entry.inputRequests),
 		DeliveredInputKeys: keys,
+		Owner:              owner,
 		Revision:           entry.loadRevision(),
 	})
 }
 
-// storeUpdate writes rec for entry with compare-and-set on entry's revision.
-// Writes for one entry are serialized by entry.storeMu, so the last write is
-// the latest snapshot. On a conflict it re-reads once: a terminal record wins
-// (returned with ErrTaskTerminal); otherwise the write is retried on top.
-func (s *MCPServer) storeUpdate(ctx context.Context, entry *taskEntry, rec TaskRecord) (TaskRecord, error) {
+// storeWrite writes entry's current state, changed by mutate, with
+// compare-and-set on entry's revision. The record is built after storeMu is
+// taken, so a write never carries an older snapshot than one before it.
+// A conflict is re-read: a terminal record wins (returned with
+// ErrTaskTerminal). For a task this process runs, a newer non-terminal
+// record means another server took it over (errTaskOwnershipLost); for a
+// read-only (remote) entry the write is retried once on top of it.
+func (s *MCPServer) storeWrite(ctx context.Context, entry *taskEntry, mutate func(*TaskRecord)) (TaskRecord, error) {
 	entry.storeMu.Lock()
 	defer entry.storeMu.Unlock()
 	ctx = context.WithoutCancel(ctx) // a state change must not be lost to its request ending
+	s.tasksMu.RLock()
+	rec := s.recordFromEntryLocked(entry)
+	s.tasksMu.RUnlock()
 	for attempt := 0; ; attempt++ {
-		rec.Revision = entry.loadRevision()
+		if mutate != nil {
+			mutate(&rec)
+		}
 		stored, err := s.taskStore.Update(ctx, rec)
 		if err == nil {
 			entry.storeRevision(stored.Revision)
@@ -147,41 +178,101 @@ func (s *MCPServer) storeUpdate(ctx context.Context, entry *taskEntry, rec TaskR
 		}
 		latest, gErr := s.taskStore.Get(ctx, rec.Task.TaskId)
 		if gErr != nil {
-			return TaskRecord{}, errors.Join(err, gErr)
-		}
-		if latest.Task.Status.IsTerminal() {
-			entry.storeRevision(latest.Revision)
-			return latest, ErrTaskTerminal
-		}
-		if attempt > 0 {
-			return TaskRecord{}, err
+			return TaskRecord{}, gErr
 		}
 		entry.storeRevision(latest.Revision)
+		if latest.Task.Status.IsTerminal() {
+			return latest, ErrTaskTerminal
+		}
+		if !entry.remote || attempt > 0 {
+			return latest, errTaskOwnershipLost
+		}
+		rec = latest
+	}
+}
+
+// storeWriteRetrying is storeWrite for outcomes that must be stored before
+// they are reported: other errors are retried with backoff (doubling up to
+// taskStoreRetryMax, logged each time) until the write succeeds, the record
+// is decided elsewhere or gone, or the task leaves this server (expiry).
+func (s *MCPServer) storeWriteRetrying(entry *taskEntry, mutate func(*TaskRecord)) (TaskRecord, error) {
+	delay := s.taskStoreRetryMin
+	for {
+		stored, err := s.storeWrite(context.Background(), entry, mutate)
+		if err == nil || errors.Is(err, ErrTaskTerminal) || errors.Is(err, errTaskOwnershipLost) || recordGone(err) {
+			return stored, err
+		}
+		if !s.holds(entry) {
+			return stored, err
+		}
+		s.logTaskStore("task store: task outcome not saved; still reported as running, retrying",
+			"task", entry.task.TaskId, "retry_in", delay, "error", err)
+		time.Sleep(delay)
+		delay = min(delay*2, s.taskStoreRetryMax)
+	}
+}
+
+// holds reports whether entry is still this server's live entry for its task.
+func (s *MCPServer) holds(entry *taskEntry) bool {
+	s.tasksMu.RLock()
+	defer s.tasksMu.RUnlock()
+	return s.tasks[entry.task.TaskId] == entry && !entry.dropped
+}
+
+// dropLostTask stops a task another server has taken over: it cancels the
+// handler and removes the entry, so readers here are served from the store.
+func (s *MCPServer) dropLostTask(entry *taskEntry) {
+	s.tasksMu.Lock()
+	id := entry.task.TaskId
+	if s.tasks[id] == entry {
+		delete(s.tasks, id)
+		if !entry.completed {
+			s.activeTasks--
+		}
+	}
+	first := !entry.dropped && !entry.completed
+	if first {
+		entry.dropped = true
+		close(entry.done) // wakes local waiters, which re-read the task from the store
+	}
+	cancel := entry.cancelFunc
+	s.tasksMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if first {
+		s.logTaskStore("task store: another server resumed this task; stopping it here", "task", id)
 	}
 }
 
 // persistLocalState writes entry's current non-terminal state. A record that
-// ended elsewhere is adopted here and its handler cancelled.
+// ended elsewhere is adopted, and one another server took is dropped; both
+// cancel the handler.
 func (s *MCPServer) persistLocalState(ctx context.Context, entry *taskEntry) error {
 	if s.taskStore == nil {
 		return nil
 	}
 	s.tasksMu.RLock()
-	if entry.completed {
-		s.tasksMu.RUnlock()
+	ended := entry.completed || entry.dropped
+	s.tasksMu.RUnlock()
+	if ended {
 		return nil
 	}
-	rec := s.recordFromEntryLocked(entry)
-	s.tasksMu.RUnlock()
-	stored, err := s.storeUpdate(ctx, entry, rec)
-	if errors.Is(err, ErrTaskTerminal) {
+	stored, err := s.storeWrite(ctx, entry, nil)
+	switch {
+	case errors.Is(err, ErrTaskTerminal):
 		s.adoptTerminal(ctx, entry, stored)
-		return err
-	}
-	if err != nil {
-		s.logTaskStore("task store: state not saved", "task", rec.Task.TaskId, "error", err)
+	case errors.Is(err, errTaskOwnershipLost):
+		s.dropLostTask(entry)
+	case err != nil:
+		return storeFailure(err)
 	}
 	return err
+}
+
+// failUnsavedState fails a task whose non-terminal state could not be stored.
+func (s *MCPServer) failUnsavedState(entry *taskEntry, err error) {
+	s.completeTask(entry, nil, fmt.Errorf("task state could not be stored: %w", err))
 }
 
 // adoptTerminal commits locally a terminal state that another writer stored first.
@@ -230,6 +321,8 @@ func hydrateEntry(rec TaskRecord) *taskEntry {
 		request:         rec.Request,
 		expiresAt:       rec.ExpiresAt,
 		resumeState:     rec.ResumeState,
+		inputRequests:   rec.InputRequests,
+		owner:           rec.Owner,
 		remote:          true,
 		createdHookDone: true,
 		done:            make(chan struct{}),
@@ -252,25 +345,47 @@ func (s *MCPServer) loadStoredEntry(ctx context.Context, taskID string) (*taskEn
 	case errors.Is(err, ErrTaskNotFound):
 		return nil, fmt.Errorf("task not found")
 	case err != nil:
-		return nil, fmt.Errorf("task store: %w", err)
+		return nil, storeFailure(err)
 	}
 	return hydrateEntry(rec), nil
 }
 
-// remoteTaskPoll is how often tasks/result re-reads a task another process runs.
-const remoteTaskPoll = time.Second
+// taskLookupError maps a task lookup failure to a request error: a store
+// failure is the server's fault (INTERNAL_ERROR), anything else the caller's.
+func taskLookupError(id any, err error) *requestError {
+	code := mcp.INVALID_PARAMS
+	if errors.Is(err, errTaskStoreFailure) {
+		code = mcp.INTERNAL_ERROR
+	}
+	return &requestError{id: id, code: code, err: err}
+}
+
+const (
+	// remoteTaskPoll is how often tasks/result re-reads a task another process runs.
+	remoteTaskPoll = time.Second
+	// remoteTaskPollErrors is how many store errors in a row the wait tolerates.
+	remoteTaskPollErrors = 3
+)
 
 // waitStoredTerminal blocks until the stored task is terminal or ctx ends.
+// Up to remoteTaskPollErrors transient store errors in a row are tolerated.
 func (s *MCPServer) waitStoredTerminal(ctx context.Context, taskID string) error {
 	t := time.NewTicker(remoteTaskPoll)
 	defer t.Stop()
+	failures := 0
 	for {
 		rec, err := s.taskStore.Get(ctx, taskID)
-		if err != nil {
+		switch {
+		case recordGone(err):
 			return err
-		}
-		if rec.Task.Status.IsTerminal() {
+		case err != nil:
+			if failures++; failures >= remoteTaskPollErrors || ctx.Err() != nil {
+				return storeFailure(err)
+			}
+		case rec.Task.Status.IsTerminal():
 			return nil
+		default:
+			failures = 0
 		}
 		select {
 		case <-ctx.Done():
@@ -296,18 +411,25 @@ func WithResumeContext(prepare func(context.Context, TaskRecord) (context.Contex
 
 // ResumeReport says what ResumeTasks did with each unfinished record.
 type ResumeReport struct {
-	Resumed []string // re-running on this server
-	Failed  []string // ended as failed (tool gone, awaiting input, bad request)
-	Skipped []string // already held by this server
+	Resumed   []string // claimed and re-running on this server
+	Failed    []string // ended as failed (tool gone, awaiting input, bad request)
+	Held      []string // already running on this server
+	Racing    []string // changed or claimed by another writer during the resume
+	Expired   []string // past ExpiresAt; deleted
+	OverLimit []string // left for later: this server is at WithMaxConcurrentTasks
+	Purged    int      // expired records deleted by DeleteExpired
 }
 
 // ResumeTasks re-runs every unfinished task in the TaskStore on this server.
-// Call it once after registering tools. Each resumed handler gets the
-// original request and its last resume state (TaskResumeStateFromContext);
-// expiry is re-armed from the stored ExpiresAt, and no created hook fires.
-// A task whose tool is no longer registered, or that was awaiting client
-// input (its responses were in the old process), fails with a clear error.
-// It assumes no other live server runs these tasks.
+// Call it once, after every tool is registered: a task whose tool is not
+// registered yet fails. Each task is claimed first (a revision bump with
+// this server as Owner), so a process still running it loses ownership at
+// its next store write and stops. The resumed handler gets the latest
+// request (the original, or the last answered input round) and its resume
+// state (TaskResumeStateFromContext); expiry is re-armed from ExpiresAt and
+// no created hook fires. A task awaiting client input fails: its pending
+// responses were in the old process. ResumeTasks also deletes expired
+// records, and keeps doing so every taskPurgeInterval until ctx ends.
 func (s *MCPServer) ResumeTasks(ctx context.Context, opts ...ResumeOption) (ResumeReport, error) {
 	var report ResumeReport
 	if s.taskStore == nil {
@@ -317,55 +439,107 @@ func (s *MCPServer) ResumeTasks(ctx context.Context, opts ...ResumeOption) (Resu
 	for _, o := range opts {
 		o(&cfg)
 	}
+	var errs []error
+	purged, err := s.taskStore.DeleteExpired(ctx, time.Now())
+	if err != nil {
+		errs = append(errs, fmt.Errorf("task store: delete expired: %w", err))
+	}
+	report.Purged = purged
+	s.purgeOnce.Do(func() { go s.purgeExpiredTasks(ctx) })
+
 	recs, err := s.taskStore.ListNonTerminal(ctx)
 	if err != nil {
-		return report, fmt.Errorf("task store: list unfinished tasks: %w", err)
+		return report, errors.Join(append(errs, fmt.Errorf("task store: list unfinished tasks: %w", err))...)
 	}
-	var errs []error
 	for _, rec := range recs {
+		outcome, rErr := s.resumeTask(ctx, rec, cfg)
 		id := rec.Task.TaskId
-		s.tasksMu.RLock()
-		_, held := s.tasks[id]
-		s.tasksMu.RUnlock()
-		if held {
-			report.Skipped = append(report.Skipped, id)
-			continue
-		}
-		resumed, rErr := s.resumeTask(ctx, rec, cfg)
 		if rErr != nil {
 			errs = append(errs, fmt.Errorf("task %s: %w", id, rErr))
 		}
-		if resumed {
+		switch outcome {
+		case resumeStarted:
 			report.Resumed = append(report.Resumed, id)
-		} else if rErr == nil {
+		case resumeFailed:
 			report.Failed = append(report.Failed, id)
+		case resumeHeld:
+			report.Held = append(report.Held, id)
+		case resumeRacing:
+			report.Racing = append(report.Racing, id)
+		case resumeExpired:
+			report.Expired = append(report.Expired, id)
+		case resumeOverLimit:
+			report.OverLimit = append(report.OverLimit, id)
 		}
 	}
 	return report, errors.Join(errs...)
 }
 
-// failStoredTask ends a record this process does not run as failed.
-func (s *MCPServer) failStoredTask(ctx context.Context, rec TaskRecord, cause error) error {
-	now := time.Now()
-	rec.Task.Status = mcp.TaskStatusFailed
-	rec.Task.StatusMessage = cause.Error()
-	rec.Task.LastUpdatedAt = now.UTC().Format(time.RFC3339)
-	rec.Error = recordError(cause)
-	_, err := s.taskStore.Update(ctx, rec)
-	if errors.Is(err, ErrTaskTerminal) {
-		return nil
+// purgeExpiredTasks deletes expired records every taskPurgeInterval until ctx ends.
+func (s *MCPServer) purgeExpiredTasks(ctx context.Context) {
+	t := time.NewTicker(s.taskPurgeInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if _, err := s.taskStore.DeleteExpired(ctx, time.Now()); err != nil && ctx.Err() == nil {
+				s.logTaskStore("task store: expired tasks not deleted", "error", err)
+			}
+		}
 	}
-	return err
 }
 
-func (s *MCPServer) resumeTask(ctx context.Context, rec TaskRecord, cfg resumeConfig) (bool, error) {
-	fail := func(cause error) (bool, error) { return false, s.failStoredTask(ctx, rec, cause) }
+type resumeOutcome int
+
+const (
+	resumeNone resumeOutcome = iota
+	resumeStarted
+	resumeFailed
+	resumeHeld
+	resumeRacing
+	resumeExpired
+	resumeOverLimit
+)
+
+// failStoredTask ends a record this process does not run as failed.
+func (s *MCPServer) failStoredTask(ctx context.Context, rec TaskRecord, cause error) (resumeOutcome, error) {
+	rec.Task.Status = mcp.TaskStatusFailed
+	rec.Task.StatusMessage = cause.Error()
+	rec.Task.LastUpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	rec.Error = recordError(cause)
+	rec.Owner = s.taskOwner
+	_, err := s.taskStore.Update(ctx, rec)
+	switch {
+	case err == nil:
+		return resumeFailed, nil
+	case errors.Is(err, ErrTaskTerminal) || errors.Is(err, ErrTaskConflict):
+		return resumeRacing, nil
+	case recordGone(err):
+		return resumeExpired, nil
+	}
+	return resumeNone, err
+}
+
+func (s *MCPServer) resumeTask(ctx context.Context, rec TaskRecord, cfg resumeConfig) (resumeOutcome, error) {
+	id := rec.Task.TaskId
+	s.tasksMu.RLock()
+	_, held := s.tasks[id]
+	atLimit := s.maxConcurrentTasks != nil && *s.maxConcurrentTasks > 0 && s.activeTasks >= *s.maxConcurrentTasks
+	s.tasksMu.RUnlock()
+	if held {
+		return resumeHeld, nil
+	}
+	if rec.ExpiresAt != nil && !time.Now().Before(*rec.ExpiresAt) {
+		return resumeExpired, s.taskStore.Delete(ctx, id)
+	}
 	if rec.Task.Status == mcp.TaskStatusInputRequired {
-		return fail(fmt.Errorf("task was awaiting client input when its server stopped; start it again"))
+		return s.failStoredTask(ctx, rec, fmt.Errorf("task was awaiting client input when its server stopped; start it again"))
 	}
 	var request mcp.CallToolRequest
 	if err := json.Unmarshal(rec.Request, &request); err != nil || request.Params.Name == "" {
-		return fail(fmt.Errorf("task's stored request cannot be resumed"))
+		return s.failStoredTask(ctx, rec, fmt.Errorf("task's stored request cannot be resumed"))
 	}
 	s.toolsMu.RLock()
 	taskTool, isTaskTool := s.taskTools[rec.ToolName]
@@ -374,7 +548,10 @@ func (s *MCPServer) resumeTask(ctx context.Context, rec TaskRecord, cfg resumeCo
 	if !isTaskTool && (!isRegularTool || regularTool.Tool.Execution == nil ||
 		(regularTool.Tool.Execution.TaskSupport != mcp.TaskSupportOptional &&
 			regularTool.Tool.Execution.TaskSupport != mcp.TaskSupportRequired)) {
-		return fail(fmt.Errorf("tool %q is no longer registered for task execution", rec.ToolName))
+		return s.failStoredTask(ctx, rec, fmt.Errorf("tool %q is not registered for task execution on this server", rec.ToolName))
+	}
+	if atLimit {
+		return resumeOverLimit, nil
 	}
 
 	runCtx := ctx
@@ -385,56 +562,62 @@ func (s *MCPServer) resumeTask(ctx context.Context, rec TaskRecord, cfg resumeCo
 	if cfg.prepare != nil {
 		prepared, err := cfg.prepare(runCtx, rec)
 		if err != nil {
-			return fail(err)
+			return s.failStoredTask(ctx, rec, err)
 		}
 		runCtx = prepared
 	}
 
+	// Claim the record before running it: the revision bump makes the next
+	// write of any process still running this task fail as ownership lost.
+	rec.Owner = s.taskOwner
+	claimed, err := s.taskStore.Update(ctx, rec)
+	switch {
+	case errors.Is(err, ErrTaskConflict) || errors.Is(err, ErrTaskTerminal):
+		return resumeRacing, nil
+	case recordGone(err):
+		return resumeExpired, nil
+	case err != nil:
+		return resumeNone, err
+	}
+
 	entry := &taskEntry{
-		task:            rec.Task,
-		sessionID:       rec.SessionID,
-		toolName:        rec.ToolName,
-		createdAt:       rec.CreatedAt,
-		modernTask:      rec.Modern,
-		protocol:        rec.Protocol,
-		request:         rec.Request,
-		expiresAt:       rec.ExpiresAt,
-		resumeState:     rec.ResumeState,
+		task:            claimed.Task,
+		sessionID:       claimed.SessionID,
+		toolName:        claimed.ToolName,
+		createdAt:       claimed.CreatedAt,
+		modernTask:      claimed.Modern,
+		protocol:        claimed.Protocol,
+		request:         claimed.Request,
+		expiresAt:       claimed.ExpiresAt,
+		resumeState:     claimed.ResumeState,
 		done:            make(chan struct{}),
 		inputReady:      make(chan struct{}, 1),
 		createdHookDone: true,
 	}
-	entry.storeRevision(rec.Revision)
-	if len(rec.DeliveredInputKeys) > 0 {
-		entry.deliveredInputKeys = make(map[string]struct{}, len(rec.DeliveredInputKeys))
-		for _, k := range rec.DeliveredInputKeys {
+	entry.storeRevision(claimed.Revision)
+	if len(claimed.DeliveredInputKeys) > 0 {
+		entry.deliveredInputKeys = make(map[string]struct{}, len(claimed.DeliveredInputKeys))
+		for _, k := range claimed.DeliveredInputKeys {
 			entry.deliveredInputKeys[k] = struct{}{}
-		}
-	}
-	var remaining time.Duration
-	if rec.ExpiresAt != nil {
-		remaining = time.Until(*rec.ExpiresAt)
-		if remaining <= 0 {
-			return false, s.taskStore.Delete(ctx, rec.Task.TaskId)
 		}
 	}
 
 	s.tasksMu.Lock()
-	if _, held := s.tasks[rec.Task.TaskId]; held {
+	if _, held := s.tasks[id]; held {
 		s.tasksMu.Unlock()
-		return false, nil
+		return resumeHeld, nil
 	}
 	s.activeTasks++
-	s.tasks[rec.Task.TaskId] = entry
+	s.tasks[id] = entry
 	s.tasksMu.Unlock()
 
-	if rec.ExpiresAt != nil {
-		go s.scheduleTaskCleanup(rec.Task.TaskId, entry, remaining.Milliseconds())
+	if claimed.ExpiresAt != nil {
+		go s.scheduleTaskCleanup(id, entry, max(time.Until(*claimed.ExpiresAt).Milliseconds(), 1))
 	}
 	if isTaskTool {
 		go s.executeTaskTool(runCtx, entry, taskTool, request)
 	} else {
 		go s.executeRegularToolAsTask(runCtx, entry, regularTool, request)
 	}
-	return true, nil
+	return resumeStarted, nil
 }

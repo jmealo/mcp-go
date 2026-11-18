@@ -279,20 +279,24 @@ type TaskStore interface {
     Delete(ctx context.Context, taskID string) error
     ListBySession(ctx context.Context, sessionID string) ([]TaskRecord, error)
     ListNonTerminal(ctx context.Context) ([]TaskRecord, error)
+    DeleteExpired(ctx context.Context, now time.Time) (int, error)
 }
 
 s := server.NewMCPServer("durable", "1.0.0",
     server.WithTaskCapabilities(true, true, true),
     server.WithTaskStore(myStore),
 )
-// ... register tools ...
-report, err := s.ResumeTasks(ctx)
+// ... register every tool first ...
+report, err := s.ResumeTasks(ctx) // ctx bounds the expired-record purge timer
 ```
 
-- **The store is the authority.** `Update` succeeds only on the stored `Revision`, and a terminal record never changes again, so the first outcome stored wins. A late result from another server is discarded and that server adopts the stored outcome. A result the store cannot save fails the task rather than being reported.
-- **Tasks this server does not run** are served from the store: `tasks/get`, `tasks/cancel`, and `tasks/result` (which polls the store until the task ends).
-- **Resume.** `ResumeTasks` re-runs each unfinished task's handler on its original request. `TaskIDFromContext` gives the task ID, and `TaskResumeStateFromContext` the state the handler last saved with `SetTaskResumeState` (for example a cursor). Expiry is re-armed from the stored `ExpiresAt`; the created hook does not fire again. `WithResumeContext` lets the application rebuild per-task context, such as the caller's identity, before the handler runs. A task awaiting client input, whose tool is no longer registered, or whose request cannot be read, fails with a clear error.
-- **Stays in the process:** cancel functions, wait channels, and input responses not yet consumed. Resume assumes no other live server runs the same tasks.
+- **The store is the authority.** `Update` succeeds only on the stored `Revision`, and a terminal record never changes again, so the first outcome stored wins and a later writer adopts it.
+- **Nothing is reported before it is stored.** If the store refuses a task's outcome, the server retries with backoff (100 ms doubling to 30 s, logged each time) and the task reads as running until the outcome is saved or the task expires. A client's `tasks/cancel` that cannot be saved returns an error. A non-terminal state that cannot be saved fails the task. Store errors are `INTERNAL_ERROR`.
+- **Ownership.** `ResumeTasks` claims each task (a revision bump with this server as `Owner`) before it runs it. A process still running the task loses ownership at its next store write: that write fails, its handler is cancelled, and its entry is dropped.
+- **Tasks this server does not run** are served from the store: `tasks/get` (including an `input_required` task's requests), `tasks/cancel`, and `tasks/result`, which polls the store every second and gives up after 3 store errors in a row. `tasks/update` for such a task fails, because the answers would not reach it.
+- **Resume.** Call `ResumeTasks` once, after every tool is registered; a task whose tool is missing fails. It re-runs each unfinished task's handler on its latest request: the original, or the last answered input round. `TaskIDFromContext` gives the task ID, and `TaskResumeStateFromContext` the state the handler last saved with `SetTaskResumeState` (for example a cursor). Expiry is re-armed from `ExpiresAt`, and the created hook does not fire again. Tasks over `WithMaxConcurrentTasks` are left for a later call (`ResumeReport.OverLimit`). `WithResumeContext` rebuilds per-task context, such as the caller's identity. A task that was waiting for client input fails, because the answers it waited for were in the old process. `ResumeTasks` also deletes expired records, and keeps doing so every minute until its context ends.
+- **Sessions.** A task stays bound to the session that created it. After a restart, a stateful client that reconnects with a new session ID cannot reach its tasks. Keep session IDs stable across restarts (a persistent `SessionIdManager`) or use stateless requests.
+- **Stays in the process:** cancel functions, wait channels, and input responses not yet consumed.
 - `MemoryTaskStore` is an in-process implementation. `server/taskstoretest.Run` is a contract suite for your own store.
 
 ## Task Status Notifications

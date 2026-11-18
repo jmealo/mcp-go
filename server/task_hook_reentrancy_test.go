@@ -19,7 +19,7 @@ func TestTaskHooksCanReadTaskState(t *testing.T) {
 			hooks := &TaskHooks{}
 			s := NewMCPServer("test", "1", WithTaskHooks(hooks))
 			observed := make(chan struct{})
-			observe := func(context.Context, TaskMetrics) { s.listTasks(t.Context()); close(observed) }
+			observe := func(context.Context, TaskMetrics) { _, _ = s.listTasks(t.Context()); close(observed) }
 			if phase == "created" {
 				hooks.AddOnTaskCreated(observe)
 			}
@@ -68,7 +68,7 @@ func TestTaskHookMetricsRemainEventSnapshotsDuringConcurrentCompletion(t *testin
 		hooks := &TaskHooks{}
 		s := NewMCPServer("test", "1", WithTaskHooks(hooks))
 		hooks.AddOnTaskStatusChanged(func(ctx context.Context, metrics TaskMetrics) {
-			s.listTasks(ctx)
+			_, _ = s.listTasks(ctx)
 			mu.Lock()
 			events = append(events, metrics)
 			mu.Unlock()

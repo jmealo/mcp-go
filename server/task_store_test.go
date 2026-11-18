@@ -188,7 +188,7 @@ func TestTaskStore_ResumeFailsWhatCannotRun(t *testing.T) {
 	report, err := b.ResumeTasks(ctx)
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []string{gone, waiting, broken}, report.Failed)
-	for id, msg := range map[string]string{gone: "no longer registered", waiting: "awaiting client input", broken: "cannot be resumed"} {
+	for id, msg := range map[string]string{gone: "not registered for task execution", waiting: "awaiting client input", broken: "cannot be resumed"} {
 		rec, err := store.Get(ctx, id)
 		require.NoError(t, err)
 		assert.Equal(t, mcp.TaskStatusFailed, rec.Task.Status, id)
@@ -293,26 +293,43 @@ func TestTaskStore_CreateFailureIsAnInternalError(t *testing.T) {
 	assert.Equal(t, mcp.INTERNAL_ERROR, reqErr.code)
 	assert.Contains(t, reqErr.err.Error(), "disk full")
 	assert.False(t, ran)
-	assert.Empty(t, s.listTasks(t.Context()), "no task is left behind")
+	listed, err := s.listTasks(t.Context())
+	require.NoError(t, err)
+	assert.Empty(t, listed, "no task is left behind")
 	s.tasksMu.RLock()
 	defer s.tasksMu.RUnlock()
 	assert.Zero(t, s.activeTasks)
 	assert.Empty(t, s.tasks)
 }
 
-// A result the store cannot save is not reported: the task fails instead.
-func TestTaskStore_UnsavedResultFailsTheTask(t *testing.T) {
+// A result the store keeps refusing is never reported: the task reads as
+// running (and the store says working) until it leaves this server at expiry.
+func TestTaskStore_RefusedResultIsNeverReported(t *testing.T) {
 	store := &failingStore{TaskStore: NewMemoryTaskStore(nil), failTerminal: mcp.TaskStatusCompleted}
 	s := durableServer(store)
+	s.taskStoreRetryMin, s.taskStoreRetryMax = 5*time.Millisecond, 10*time.Millisecond
 	s.AddTool(taskTool("work"), func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		return mcp.NewToolResultText("unsaved"), nil
 	})
-	id := startLegacyTask(t, s, "work")
-	task := waitLocalTerminal(t, s, id)
-	assert.Equal(t, mcp.TaskStatusFailed, task.Status)
-	assert.Contains(t, task.StatusMessage, "could not be stored")
-	rec := waitStored(t, store, id, func(r TaskRecord) bool { return r.Task.Status.IsTerminal() })
-	assert.Equal(t, mcp.TaskStatusFailed, rec.Task.Status, "the stored state matches what is reported")
+	ttl := int64(300)
+	res, reqErr := s.handleToolCall(t.Context(), 1, mcp.CallToolRequest{Params: mcp.CallToolParams{Name: "work", Task: &mcp.TaskParams{TTL: &ttl}}})
+	require.Nil(t, reqErr)
+	id := res.(*mcp.CreateTaskResult).Task.TaskId
+	require.Eventually(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.failures >= 3
+	}, 5*time.Second, time.Millisecond, "the outcome is retried")
+	task, _, err := s.getTask(t.Context(), id)
+	require.NoError(t, err)
+	assert.Equal(t, mcp.TaskStatusWorking, task.Status)
+	rec, err := store.Get(context.Background(), id)
+	require.NoError(t, err)
+	assert.Equal(t, mcp.TaskStatusWorking, rec.Task.Status, "memory and store agree")
+	require.Eventually(t, func() bool {
+		_, _, err := s.getTask(context.Background(), id)
+		return err != nil
+	}, 5*time.Second, 5*time.Millisecond, "the task expires and the retries stop")
 }
 
 // Without a store, nothing about tasks changes (the default).

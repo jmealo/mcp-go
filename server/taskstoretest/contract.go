@@ -265,6 +265,31 @@ func Run(t *testing.T, newStore NewStore) {
 		}
 	})
 
+	t.Run("delete expired", func(t *testing.T) {
+		s, c := fresh(t)
+		soon, later := c.now().Add(time.Minute), c.now().Add(time.Hour)
+		for id, exp := range map[string]*time.Time{"soon": &soon, "later": &later, "never": nil} {
+			rec := record(id, "", mcp.TaskStatusWorking)
+			rec.ExpiresAt = exp
+			mustCreate(t, s, rec)
+		}
+		if n, err := s.DeleteExpired(ctx, c.now()); err != nil || n != 0 {
+			t.Fatalf("DeleteExpired before any expiry = %d, %v; want 0", n, err)
+		}
+		n, err := s.DeleteExpired(ctx, soon)
+		if err != nil || n != 1 {
+			t.Fatalf("DeleteExpired at the first expiry = %d, %v; want 1", n, err)
+		}
+		if _, err := s.Get(ctx, "soon"); !errors.Is(err, server.ErrTaskNotFound) {
+			t.Fatalf("Get of a purged record err = %v, want ErrTaskNotFound", err)
+		}
+		for _, id := range []string{"later", "never"} {
+			if _, err := s.Get(ctx, id); err != nil {
+				t.Fatalf("DeleteExpired removed %s: %v", id, err)
+			}
+		}
+	})
+
 	t.Run("returned records are copies", func(t *testing.T) {
 		s, _ := fresh(t)
 		rec := record("a", "", mcp.TaskStatusWorking)
