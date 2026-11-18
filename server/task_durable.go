@@ -273,7 +273,9 @@ func (s *MCPServer) commitStored(ctx context.Context, entry *taskEntry, stored T
 // to be resumed by the next server; here they are released (their slots
 // freed, and local tasks/result waiters answered "server is stopping").
 // StreamableHTTPServer.Shutdown and SSEServer.Shutdown call it; with other
-// transports, call it yourself. It is safe to call more than once.
+// transports, call it yourself. It is safe to call more than once. It is
+// per MCPServer, not per transport: with one server behind several
+// transports, the first Shutdown stops task store work for all of them.
 func (s *MCPServer) StopTaskStore() {
 	if s.taskStoreStop != nil {
 		s.taskStoreStop()
