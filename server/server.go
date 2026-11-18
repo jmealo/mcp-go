@@ -78,6 +78,12 @@ type taskEntry struct {
 	owner string
 	// dropped marks a local entry whose task another server took over.
 	dropped bool
+	// outcomePending is set while the task's outcome is being stored;
+	// cancelOverride is a client cancel received meanwhile, which replaces
+	// the outcome; wake cuts the retry wait short. Guarded by tasksMu.
+	outcomePending bool
+	cancelOverride *string
+	wake           chan struct{}
 	// storeMu serializes this entry's store writes; revision is the stored
 	// record's revision they compare against.
 	storeMu  sync.Mutex
@@ -304,6 +310,9 @@ type MCPServer struct {
 	taskStoreRetryMax            time.Duration
 	taskPurgeInterval            time.Duration
 	purgeOnce                    sync.Once
+	taskStoreCtx                 context.Context // ended by StopTaskStore
+	taskStoreStop                context.CancelFunc
+	remoteTaskPoll               time.Duration
 	expiredTasks                 map[string]time.Time // Tracks recently expired task IDs with expiration timestamp
 	maxConcurrentTasks           *int                 // Optional limit on concurrent running tasks
 	defaultTaskTTLMs             *int64               // Fallback TTL applied when client supplies none
@@ -3388,6 +3397,7 @@ func (s *MCPServer) createTaskFor(ctx context.Context, taskID string, toolName s
 		modernTask: IsModernRequest(ctx),
 		done:       make(chan struct{}),
 		inputReady: make(chan struct{}, 1),
+		wake:       make(chan struct{}, 1),
 	}
 	if info := RequestProtocolInfoFromContext(ctx); info != nil {
 		p := *info
@@ -3643,14 +3653,22 @@ func applyTerminal(rec *TaskRecord, status mcp.TaskStatus, message string, at ti
 }
 
 // storeCompletion stores the task's outcome. It returns the outcome to commit
-// locally, or handled when nothing more is to be done here.
+// locally, or handled when nothing more is to be done here. A client cancel
+// that arrives while the outcome is unsaved wins: the cancellation is stored
+// (and reported) instead.
 func (s *MCPServer) storeCompletion(entry *taskEntry, result any, err error) (any, error, bool) {
-	s.tasksMu.RLock()
-	ended := entry.completed || entry.dropped
-	s.tasksMu.RUnlock()
-	if ended {
+	s.tasksMu.Lock()
+	if entry.completed || entry.dropped {
+		s.tasksMu.Unlock()
 		return result, err, true
 	}
+	entry.outcomePending = true
+	s.tasksMu.Unlock()
+	defer func() {
+		s.tasksMu.Lock()
+		entry.outcomePending = false
+		s.tasksMu.Unlock()
+	}()
 	var raw json.RawMessage
 	if err == nil {
 		b, mErr := json.Marshal(result)
@@ -3661,6 +3679,13 @@ func (s *MCPServer) storeCompletion(entry *taskEntry, result any, err error) (an
 		}
 	}
 	stored, pErr := s.storeWriteRetrying(entry, func(r *TaskRecord) {
+		r.InputRequests = nil
+		if msg, ok := s.pendingCancel(entry); ok {
+			applyTerminal(r, mcp.TaskStatusCancelled, msg, time.Now())
+			r.Error = recordError(context.Canceled)
+			r.Result = nil
+			return
+		}
 		if err != nil {
 			applyTerminal(r, mcp.TaskStatusFailed, err.Error(), time.Now())
 			r.Error = recordError(err)
@@ -3670,17 +3695,22 @@ func (s *MCPServer) storeCompletion(entry *taskEntry, result any, err error) (an
 			r.Result = raw
 			r.Error = nil
 		}
-		r.InputRequests = nil
 	})
 	switch {
 	case errors.Is(pErr, ErrTaskTerminal):
 		s.adoptTerminal(context.Background(), entry, stored)
 		return nil, nil, true
-	case errors.Is(pErr, errTaskOwnershipLost):
+	case errors.Is(pErr, ErrTaskOwnershipLost):
 		s.dropLostTask(entry)
 		return nil, nil, true
-	case pErr != nil && !recordGone(pErr):
-		// The task left this server (expiry) while the outcome was unsaved.
+	case errors.Is(pErr, errTaskStoreStopped):
+		// Shutting down: the store keeps the task running for the next server.
+		return nil, nil, true
+	}
+	// Stored, or the task left this server (expiry) while unsaved: commit;
+	// in the latter case invisibly, to release its slot and its waiters.
+	if msg, ok := s.pendingCancel(entry); ok {
+		s.commitCancel(context.Background(), entry, msg)
 		return nil, nil, true
 	}
 	return result, err, false
@@ -3775,9 +3805,20 @@ func (s *MCPServer) cancelEntry(ctx context.Context, entry *taskEntry, message s
 		return nil
 	}
 	if s.taskStore != nil {
-		s.tasksMu.RLock()
+		s.tasksMu.Lock()
 		completed, dropped, status := entry.completed, entry.dropped, entry.task.Status
-		s.tasksMu.RUnlock()
+		if requested && !entry.remote && !completed && !dropped && entry.outcomePending {
+			// The outcome is still unsaved: the cancel replaces it, and is
+			// reported once stored. The ack only says the cancel was accepted.
+			entry.cancelOverride = &message
+			select {
+			case entry.wake <- struct{}{}:
+			default:
+			}
+			s.tasksMu.Unlock()
+			return nil
+		}
+		s.tasksMu.Unlock()
 		if completed {
 			return terminal(status)
 		}
@@ -3802,11 +3843,15 @@ func (s *MCPServer) cancelEntry(ctx context.Context, entry *taskEntry, message s
 				s.adoptTerminal(ctx, entry, stored)
 			}
 			return terminal(stored.Task.Status)
-		case errors.Is(err, errTaskOwnershipLost):
+		case errors.Is(err, ErrTaskOwnershipLost):
 			if entry.remote {
 				return storeFailure(err)
 			}
 			s.dropLostTask(entry)
+			if requested {
+				// Another server runs the task now: cancel it there, through the store.
+				return s.cancelEntry(ctx, hydrateEntry(stored), message, rejectTerminal, true)
+			}
 			return nil
 		case recordGone(err):
 			if entry.remote {
@@ -3814,9 +3859,11 @@ func (s *MCPServer) cancelEntry(ctx context.Context, entry *taskEntry, message s
 			}
 		case err != nil && (requested || entry.remote):
 			return storeFailure(fmt.Errorf("cancellation not saved: %w", err))
-		case err != nil:
-			return nil // the task left this server while the cancellation was unsaved
+		case errors.Is(err, errTaskStoreStopped):
+			return nil // shutting down: the store keeps the task for the next server
 		}
+		// Stored, or the task left this server (expiry) while unsaved: commit,
+		// in the latter case invisibly, to release its slot and its waiters.
 		if entry.remote {
 			// Stored; the process running the task finds it terminal on its next write.
 			return nil

@@ -107,9 +107,13 @@ type TaskStore interface {
 // client that comes back with a new session ID cannot reach its tasks;
 // keep session IDs stable across restarts (a persistent SessionIdManager)
 // or use stateless requests.
+//
+// Call StopTaskStore when shutting the server down.
 func WithTaskStore(store TaskStore) ServerOption {
 	return func(s *MCPServer) {
 		s.taskStore = store
+		s.taskStoreCtx, s.taskStoreStop = context.WithCancel(context.Background())
+		s.remoteTaskPoll = time.Second
 		s.taskOwner = uuid.NewString()
 		s.taskStoreRetryMin = 100 * time.Millisecond
 		s.taskStoreRetryMax = 30 * time.Second

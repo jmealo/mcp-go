@@ -40,13 +40,16 @@ func recordError(err error) *TaskRecordError {
 	return &TaskRecordError{Details: *taskErrorDetails(err), Cancelled: errors.Is(err, context.Canceled)}
 }
 
-// errTaskOwnershipLost: the stored record moved on (a newer revision, not
-// terminal) without this process: another server resumed the task.
-var errTaskOwnershipLost = errors.New("task ownership lost: another server resumed it")
+// ErrTaskOwnershipLost is returned by SetTaskResumeState when another
+// server has resumed (claimed) the task; the handler's context is cancelled.
+var ErrTaskOwnershipLost = errors.New("task ownership lost: another server resumed it")
 
 // errTaskStoreFailure wraps store errors other than the sentinels, so request
 // handlers answer INTERNAL_ERROR rather than INVALID_PARAMS.
 var errTaskStoreFailure = errors.New("task store")
+
+// errTaskStoreStopped: StopTaskStore ended a retry.
+var errTaskStoreStopped = errors.New("task store stopped")
 
 func storeFailure(err error) error { return fmt.Errorf("%w: %w", errTaskStoreFailure, err) }
 
@@ -105,7 +108,11 @@ func SetTaskResumeState(ctx context.Context, state json.RawMessage) error {
 	}
 	s, entry := h.server, h.entry
 	s.tasksMu.Lock()
-	if entry.completed || entry.dropped {
+	if entry.dropped {
+		s.tasksMu.Unlock()
+		return ErrTaskOwnershipLost
+	}
+	if entry.completed {
 		s.tasksMu.Unlock()
 		return ErrTaskTerminal
 	}
@@ -155,7 +162,7 @@ func (s *MCPServer) recordFromEntryLocked(entry *taskEntry) TaskRecord {
 // taken, so a write never carries an older snapshot than one before it.
 // A conflict is re-read: a terminal record wins (returned with
 // ErrTaskTerminal). For a task this process runs, a newer non-terminal
-// record means another server took it over (errTaskOwnershipLost); for a
+// record means another server took it over (ErrTaskOwnershipLost); for a
 // read-only (remote) entry the write is retried once on top of it.
 func (s *MCPServer) storeWrite(ctx context.Context, entry *taskEntry, mutate func(*TaskRecord)) (TaskRecord, error) {
 	entry.storeMu.Lock()
@@ -185,7 +192,7 @@ func (s *MCPServer) storeWrite(ctx context.Context, entry *taskEntry, mutate fun
 			return latest, ErrTaskTerminal
 		}
 		if !entry.remote || attempt > 0 {
-			return latest, errTaskOwnershipLost
+			return latest, ErrTaskOwnershipLost
 		}
 		rec = latest
 	}
@@ -195,11 +202,13 @@ func (s *MCPServer) storeWrite(ctx context.Context, entry *taskEntry, mutate fun
 // they are reported: other errors are retried with backoff (doubling up to
 // taskStoreRetryMax, logged each time) until the write succeeds, the record
 // is decided elsewhere or gone, or the task leaves this server (expiry).
+// The wait is cut short by a client cancel (entry.wake) and ended by
+// StopTaskStore (errTaskStoreStopped).
 func (s *MCPServer) storeWriteRetrying(entry *taskEntry, mutate func(*TaskRecord)) (TaskRecord, error) {
 	delay := s.taskStoreRetryMin
 	for {
 		stored, err := s.storeWrite(context.Background(), entry, mutate)
-		if err == nil || errors.Is(err, ErrTaskTerminal) || errors.Is(err, errTaskOwnershipLost) || recordGone(err) {
+		if err == nil || errors.Is(err, ErrTaskTerminal) || errors.Is(err, ErrTaskOwnershipLost) || recordGone(err) {
 			return stored, err
 		}
 		if !s.holds(entry) {
@@ -207,8 +216,37 @@ func (s *MCPServer) storeWriteRetrying(entry *taskEntry, mutate func(*TaskRecord
 		}
 		s.logTaskStore("task store: task outcome not saved; still reported as running, retrying",
 			"task", entry.task.TaskId, "retry_in", delay, "error", err)
-		time.Sleep(delay)
+		t := time.NewTimer(delay)
+		select {
+		case <-t.C:
+		case <-entry.wake:
+			t.Stop()
+		case <-s.taskStoreCtx.Done():
+			t.Stop()
+			return stored, errTaskStoreStopped
+		}
 		delay = min(delay*2, s.taskStoreRetryMax)
+	}
+}
+
+// pendingCancel returns a client cancel received while the task's outcome
+// was still unsaved; it replaces that outcome.
+func (s *MCPServer) pendingCancel(entry *taskEntry) (string, bool) {
+	s.tasksMu.RLock()
+	defer s.tasksMu.RUnlock()
+	if entry.cancelOverride == nil {
+		return "", false
+	}
+	return *entry.cancelOverride, true
+}
+
+// StopTaskStore ends the server's task store work: the expired-record purge
+// started by ResumeTasks, and the retries of unsaved task outcomes (those
+// tasks stay as the store has them, to be resumed by the next server). Call
+// it when shutting the server down. It is safe to call more than once.
+func (s *MCPServer) StopTaskStore() {
+	if s.taskStoreStop != nil {
+		s.taskStoreStop()
 	}
 }
 
@@ -262,7 +300,7 @@ func (s *MCPServer) persistLocalState(ctx context.Context, entry *taskEntry) err
 	switch {
 	case errors.Is(err, ErrTaskTerminal):
 		s.adoptTerminal(ctx, entry, stored)
-	case errors.Is(err, errTaskOwnershipLost):
+	case errors.Is(err, ErrTaskOwnershipLost):
 		s.dropLostTask(entry)
 	case err != nil:
 		return storeFailure(err)
@@ -361,8 +399,6 @@ func taskLookupError(id any, err error) *requestError {
 }
 
 const (
-	// remoteTaskPoll is how often tasks/result re-reads a task another process runs.
-	remoteTaskPoll = time.Second
 	// remoteTaskPollErrors is how many store errors in a row the wait tolerates.
 	remoteTaskPollErrors = 3
 )
@@ -370,7 +406,7 @@ const (
 // waitStoredTerminal blocks until the stored task is terminal or ctx ends.
 // Up to remoteTaskPollErrors transient store errors in a row are tolerated.
 func (s *MCPServer) waitStoredTerminal(ctx context.Context, taskID string) error {
-	t := time.NewTicker(remoteTaskPoll)
+	t := time.NewTicker(s.remoteTaskPoll)
 	defer t.Stop()
 	failures := 0
 	for {
@@ -416,7 +452,7 @@ type ResumeReport struct {
 	Held      []string // already running on this server
 	Racing    []string // changed or claimed by another writer during the resume
 	Expired   []string // past ExpiresAt; deleted
-	OverLimit []string // left for later: this server is at WithMaxConcurrentTasks
+	OverLimit []string // failed: over WithMaxConcurrentTasks at resume
 	Purged    int      // expired records deleted by DeleteExpired
 }
 
@@ -429,7 +465,8 @@ type ResumeReport struct {
 // state (TaskResumeStateFromContext); expiry is re-armed from ExpiresAt and
 // no created hook fires. A task awaiting client input fails: its pending
 // responses were in the old process. ResumeTasks also deletes expired
-// records, and keeps doing so every taskPurgeInterval until ctx ends.
+// records, and keeps doing so every minute until StopTaskStore; tasks over
+// WithMaxConcurrentTasks fail (reported as OverLimit).
 func (s *MCPServer) ResumeTasks(ctx context.Context, opts ...ResumeOption) (ResumeReport, error) {
 	var report ResumeReport
 	if s.taskStore == nil {
@@ -445,7 +482,7 @@ func (s *MCPServer) ResumeTasks(ctx context.Context, opts ...ResumeOption) (Resu
 		errs = append(errs, fmt.Errorf("task store: delete expired: %w", err))
 	}
 	report.Purged = purged
-	s.purgeOnce.Do(func() { go s.purgeExpiredTasks(ctx) })
+	s.purgeOnce.Do(func() { go s.purgeExpiredTasks() })
 
 	recs, err := s.taskStore.ListNonTerminal(ctx)
 	if err != nil {
@@ -475,8 +512,10 @@ func (s *MCPServer) ResumeTasks(ctx context.Context, opts ...ResumeOption) (Resu
 	return report, errors.Join(errs...)
 }
 
-// purgeExpiredTasks deletes expired records every taskPurgeInterval until ctx ends.
-func (s *MCPServer) purgeExpiredTasks(ctx context.Context) {
+// purgeExpiredTasks deletes expired records every taskPurgeInterval until
+// StopTaskStore.
+func (s *MCPServer) purgeExpiredTasks() {
+	ctx := s.taskStoreCtx
 	t := time.NewTicker(s.taskPurgeInterval)
 	defer t.Stop()
 	for {
@@ -551,7 +590,11 @@ func (s *MCPServer) resumeTask(ctx context.Context, rec TaskRecord, cfg resumeCo
 		return s.failStoredTask(ctx, rec, fmt.Errorf("tool %q is not registered for task execution on this server", rec.ToolName))
 	}
 	if atLimit {
-		return resumeOverLimit, nil
+		outcome, err := s.failStoredTask(ctx, rec, fmt.Errorf("over the concurrent task limit at resume; start it again"))
+		if outcome == resumeFailed {
+			outcome = resumeOverLimit
+		}
+		return outcome, err
 	}
 
 	runCtx := ctx
@@ -592,6 +635,7 @@ func (s *MCPServer) resumeTask(ctx context.Context, rec TaskRecord, cfg resumeCo
 		resumeState:     claimed.ResumeState,
 		done:            make(chan struct{}),
 		inputReady:      make(chan struct{}, 1),
+		wake:            make(chan struct{}, 1),
 		createdHookDone: true,
 	}
 	entry.storeRevision(claimed.Revision)
@@ -602,11 +646,8 @@ func (s *MCPServer) resumeTask(ctx context.Context, rec TaskRecord, cfg resumeCo
 		}
 	}
 
+	// The claim above is the only way in: a second claimant gets a conflict.
 	s.tasksMu.Lock()
-	if _, held := s.tasks[id]; held {
-		s.tasksMu.Unlock()
-		return resumeHeld, nil
-	}
 	s.activeTasks++
 	s.tasks[id] = entry
 	s.tasksMu.Unlock()
