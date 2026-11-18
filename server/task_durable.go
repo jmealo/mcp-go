@@ -108,6 +108,10 @@ func SetTaskResumeState(ctx context.Context, state json.RawMessage) error {
 	}
 	s, entry := h.server, h.entry
 	s.tasksMu.Lock()
+	if entry.stopped {
+		s.tasksMu.Unlock()
+		return errServerStopping
+	}
 	if entry.dropped {
 		s.tasksMu.Unlock()
 		return ErrTaskOwnershipLost
@@ -202,8 +206,7 @@ func (s *MCPServer) storeWrite(ctx context.Context, entry *taskEntry, mutate fun
 // they are reported: other errors are retried with backoff (doubling up to
 // taskStoreRetryMax, logged each time) until the write succeeds, the record
 // is decided elsewhere or gone, or the task leaves this server (expiry).
-// The wait is cut short by a client cancel (entry.wake) and ended by
-// StopTaskStore (errTaskStoreStopped).
+// StopTaskStore ends the wait (errTaskStoreStopped).
 func (s *MCPServer) storeWriteRetrying(entry *taskEntry, mutate func(*TaskRecord)) (TaskRecord, error) {
 	delay := s.taskStoreRetryMin
 	for {
@@ -219,8 +222,6 @@ func (s *MCPServer) storeWriteRetrying(entry *taskEntry, mutate func(*TaskRecord
 		t := time.NewTimer(delay)
 		select {
 		case <-t.C:
-		case <-entry.wake:
-			t.Stop()
 		case <-s.taskStoreCtx.Done():
 			t.Stop()
 			return stored, errTaskStoreStopped
@@ -229,21 +230,50 @@ func (s *MCPServer) storeWriteRetrying(entry *taskEntry, mutate func(*TaskRecord
 	}
 }
 
-// pendingCancel returns a client cancel received while the task's outcome
-// was still unsaved; it replaces that outcome.
-func (s *MCPServer) pendingCancel(entry *taskEntry) (string, bool) {
-	s.tasksMu.RLock()
-	defer s.tasksMu.RUnlock()
-	if entry.cancelOverride == nil {
-		return "", false
+// errServerStopping answers waiters of tasks released by StopTaskStore.
+// It wraps errTaskStoreFailure, so request handlers answer INTERNAL_ERROR.
+var errServerStopping = fmt.Errorf("%w: server is stopping; the task's state is kept for the next server", errTaskStoreFailure)
+
+// releaseStopped lets go of a task whose state StopTaskStore left unsaved:
+// it frees the slot and wakes local waiters (they get errServerStopping).
+// Nothing is reported as terminal: the store still has the task running.
+func (s *MCPServer) releaseStopped(entry *taskEntry) {
+	s.tasksMu.Lock()
+	id := entry.task.TaskId
+	if s.tasks[id] == entry {
+		delete(s.tasks, id)
+		if !entry.completed {
+			s.activeTasks--
+		}
 	}
-	return *entry.cancelOverride, true
+	if !entry.dropped && !entry.completed {
+		entry.dropped, entry.stopped = true, true
+		close(entry.done)
+	}
+	cancel := entry.cancelFunc
+	s.tasksMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
-// StopTaskStore ends the server's task store work: the expired-record purge
-// started by ResumeTasks, and the retries of unsaved task outcomes (those
-// tasks stay as the store has them, to be resumed by the next server). Call
-// it when shutting the server down. It is safe to call more than once.
+// commitStored commits locally the terminal record the store returned.
+func (s *MCPServer) commitStored(ctx context.Context, entry *taskEntry, stored TaskRecord) {
+	if stored.Task.Status == mcp.TaskStatusCancelled {
+		s.commitCancel(ctx, entry, stored.Task.StatusMessage)
+		return
+	}
+	result, err := hydrateOutcome(stored)
+	s.commitComplete(entry, result, err)
+}
+
+// StopTaskStore is for process shutdown. It ends the server's task store
+// work: the expired-record purge started by ResumeTasks, and the retries of
+// unsaved task outcomes. Those tasks stay as the store has them (running),
+// to be resumed by the next server; here they are released (their slots
+// freed, and local tasks/result waiters answered "server is stopping").
+// StreamableHTTPServer.Shutdown and SSEServer.Shutdown call it; with other
+// transports, call it yourself. It is safe to call more than once.
 func (s *MCPServer) StopTaskStore() {
 	if s.taskStoreStop != nil {
 		s.taskStoreStop()
@@ -426,6 +456,8 @@ func (s *MCPServer) waitStoredTerminal(ctx context.Context, taskID string) error
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-s.taskStoreCtx.Done():
+			return errServerStopping
 		case <-t.C:
 		}
 	}
@@ -635,7 +667,6 @@ func (s *MCPServer) resumeTask(ctx context.Context, rec TaskRecord, cfg resumeCo
 		resumeState:     claimed.ResumeState,
 		done:            make(chan struct{}),
 		inputReady:      make(chan struct{}, 1),
-		wake:            make(chan struct{}, 1),
 		createdHookDone: true,
 	}
 	entry.storeRevision(claimed.Revision)

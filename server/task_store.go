@@ -108,7 +108,9 @@ type TaskStore interface {
 // keep session IDs stable across restarts (a persistent SessionIdManager)
 // or use stateless requests.
 //
-// Call StopTaskStore when shutting the server down.
+// Shutdown: StopTaskStore must run at process shutdown. The streamable HTTP
+// and SSE servers' Shutdown call it; with stdio or a custom transport, call
+// it yourself.
 func WithTaskStore(store TaskStore) ServerOption {
 	return func(s *MCPServer) {
 		s.taskStore = store

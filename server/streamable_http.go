@@ -564,6 +564,9 @@ func (s *StreamableHTTPServer) Start(addr string) error {
 // Shutdown gracefully stops the server, closing all active sessions
 // and shutting down the HTTP server.
 func (s *StreamableHTTPServer) Shutdown(ctx context.Context) error {
+	if s.server != nil {
+		s.server.StopTaskStore() // durable tasks: stop store retries and purge
+	}
 	if s.sweeperCancel != nil {
 		s.sweeperCancel()
 	}

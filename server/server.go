@@ -78,12 +78,11 @@ type taskEntry struct {
 	owner string
 	// dropped marks a local entry whose task another server took over.
 	dropped bool
-	// outcomePending is set while the task's outcome is being stored;
-	// cancelOverride is a client cancel received meanwhile, which replaces
-	// the outcome; wake cuts the retry wait short. Guarded by tasksMu.
+	// outcomePending is set while the task's outcome is being stored; a
+	// client cancel meanwhile is refused. Guarded by tasksMu.
 	outcomePending bool
-	cancelOverride *string
-	wake           chan struct{}
+	// stopped marks an entry released by StopTaskStore with its state unsaved.
+	stopped bool
 	// storeMu serializes this entry's store writes; revision is the stored
 	// record's revision they compare against.
 	storeMu  sync.Mutex
@@ -3397,7 +3396,6 @@ func (s *MCPServer) createTaskFor(ctx context.Context, taskID string, toolName s
 		modernTask: IsModernRequest(ctx),
 		done:       make(chan struct{}),
 		inputReady: make(chan struct{}, 1),
-		wake:       make(chan struct{}, 1),
 	}
 	if info := RequestProtocolInfoFromContext(ctx); info != nil {
 		p := *info
@@ -3652,10 +3650,9 @@ func applyTerminal(rec *TaskRecord, status mcp.TaskStatus, message string, at ti
 	rec.Task.LastUpdatedAt = at.UTC().Format(time.RFC3339)
 }
 
-// storeCompletion stores the task's outcome. It returns the outcome to commit
-// locally, or handled when nothing more is to be done here. A client cancel
-// that arrives while the outcome is unsaved wins: the cancellation is stored
-// (and reported) instead.
+// storeCompletion stores the task's outcome and commits locally exactly
+// what the store then holds; it reports handled when that is done (or
+// nothing is left to do) and false only for the no-store fallbacks below.
 func (s *MCPServer) storeCompletion(entry *taskEntry, result any, err error) (any, error, bool) {
 	s.tasksMu.Lock()
 	if entry.completed || entry.dropped {
@@ -3680,12 +3677,6 @@ func (s *MCPServer) storeCompletion(entry *taskEntry, result any, err error) (an
 	}
 	stored, pErr := s.storeWriteRetrying(entry, func(r *TaskRecord) {
 		r.InputRequests = nil
-		if msg, ok := s.pendingCancel(entry); ok {
-			applyTerminal(r, mcp.TaskStatusCancelled, msg, time.Now())
-			r.Error = recordError(context.Canceled)
-			r.Result = nil
-			return
-		}
 		if err != nil {
 			applyTerminal(r, mcp.TaskStatusFailed, err.Error(), time.Now())
 			r.Error = recordError(err)
@@ -3697,22 +3688,19 @@ func (s *MCPServer) storeCompletion(entry *taskEntry, result any, err error) (an
 		}
 	})
 	switch {
-	case errors.Is(pErr, ErrTaskTerminal):
-		s.adoptTerminal(context.Background(), entry, stored)
+	case pErr == nil, errors.Is(pErr, ErrTaskTerminal):
+		// The store is the only source of the committed state.
+		s.commitStored(context.Background(), entry, stored)
 		return nil, nil, true
 	case errors.Is(pErr, ErrTaskOwnershipLost):
 		s.dropLostTask(entry)
 		return nil, nil, true
 	case errors.Is(pErr, errTaskStoreStopped):
-		// Shutting down: the store keeps the task running for the next server.
+		s.releaseStopped(entry)
 		return nil, nil, true
 	}
-	// Stored, or the task left this server (expiry) while unsaved: commit;
-	// in the latter case invisibly, to release its slot and its waiters.
-	if msg, ok := s.pendingCancel(entry); ok {
-		s.commitCancel(context.Background(), entry, msg)
-		return nil, nil, true
-	}
+	// The record is gone, or the task left this server (expiry) while its
+	// outcome was unsaved: commit invisibly, to release its slot and waiters.
 	return result, err, false
 }
 
@@ -3807,18 +3795,13 @@ func (s *MCPServer) cancelEntry(ctx context.Context, entry *taskEntry, message s
 	if s.taskStore != nil {
 		s.tasksMu.Lock()
 		completed, dropped, status := entry.completed, entry.dropped, entry.task.Status
-		if requested && !entry.remote && !completed && !dropped && entry.outcomePending {
-			// The outcome is still unsaved: the cancel replaces it, and is
-			// reported once stored. The ack only says the cancel was accepted.
-			entry.cancelOverride = &message
-			select {
-			case entry.wake <- struct{}{}:
-			default:
-			}
-			s.tasksMu.Unlock()
-			return nil
-		}
+		pending := requested && !entry.remote && !completed && !dropped && entry.outcomePending
 		s.tasksMu.Unlock()
+		if pending {
+			// The outcome is decided but not yet stored; it will win, so a
+			// cancel now is refused rather than acked and then lost.
+			return storeFailure(errors.New("task outcome pending; retry"))
+		}
 		if completed {
 			return terminal(status)
 		}
@@ -3843,6 +3826,9 @@ func (s *MCPServer) cancelEntry(ctx context.Context, entry *taskEntry, message s
 				s.adoptTerminal(ctx, entry, stored)
 			}
 			return terminal(stored.Task.Status)
+		case errors.Is(err, errTaskStoreStopped):
+			s.releaseStopped(entry)
+			return nil
 		case errors.Is(err, ErrTaskOwnershipLost):
 			if entry.remote {
 				return storeFailure(err)
@@ -3859,8 +3845,6 @@ func (s *MCPServer) cancelEntry(ctx context.Context, entry *taskEntry, message s
 			}
 		case err != nil && (requested || entry.remote):
 			return storeFailure(fmt.Errorf("cancellation not saved: %w", err))
-		case errors.Is(err, errTaskStoreStopped):
-			return nil // shutting down: the store keeps the task for the next server
 		}
 		// Stored, or the task left this server (expiry) while unsaved: commit,
 		// in the latter case invisibly, to release its slot and its waiters.

@@ -160,34 +160,103 @@ func TestTaskStore_ExpiryDuringRetryReleasesSlot(t *testing.T) {
 	assert.Nil(t, reqErr)
 }
 
-// A client cancel while the outcome is unsaved interrupts the retry wait
-// and wins: the cancellation is what gets stored and reported.
-func TestTaskStore_CancelDuringPendingOutcome(t *testing.T) {
+// blockingTerminalStore holds the first terminal write inside Update until
+// release is closed, then lets it succeed.
+type blockingTerminalStore struct {
+	TaskStore
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingTerminalStore) Update(ctx context.Context, rec TaskRecord) (TaskRecord, error) {
+	if rec.Task.Status.IsTerminal() {
+		first := false
+		b.once.Do(func() { first = true })
+		if first {
+			close(b.entered)
+			<-b.release
+		}
+	}
+	return b.TaskStore.Update(ctx, rec)
+}
+
+// A cancel racing a terminal write that then succeeds is refused, and this
+// server reports exactly what the store holds.
+func TestTaskStore_CancelRacingTerminalWrite(t *testing.T) {
+	store := &blockingTerminalStore{TaskStore: NewMemoryTaskStore(nil), entered: make(chan struct{}), release: make(chan struct{})}
+	s := durableServer(store)
+	t.Cleanup(s.StopTaskStore)
+	s.AddTool(taskTool("work"), func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return mcp.NewToolResultText("done"), nil
+	})
+	id := startLegacyTask(t, s, "work")
+	<-store.entered // the outcome is inside Update
+	_, reqErr := s.handleCancelTask(t.Context(), 2, mcp.CancelTaskRequest{Params: mcp.CancelTaskParams{TaskId: id}})
+	require.NotNil(t, reqErr, "a cancel is not acked while the outcome is being stored")
+	assert.Equal(t, mcp.INTERNAL_ERROR, reqErr.code)
+	assert.Contains(t, reqErr.err.Error(), "outcome pending")
+	close(store.release)
+	task := waitLocalTerminal(t, s, id)
+	rec, _ := store.Get(context.Background(), id)
+	assert.Equal(t, rec.Task.Status, task.Status, "tasks/get and the store agree")
+	assert.Equal(t, mcp.TaskStatusCompleted, task.Status)
+}
+
+// A cancel while the outcome is still refused by the store gets an error,
+// and the outcome then wins once stored.
+func TestTaskStore_CancelDuringPendingOutcomeIsRefused(t *testing.T) {
 	store := newGatedStore()
 	s := durableServer(store)
 	t.Cleanup(s.StopTaskStore)
-	s.taskStoreRetryMin, s.taskStoreRetryMax = time.Hour, time.Hour // only a wake ends the wait
+	s.taskStoreRetryMin, s.taskStoreRetryMax = time.Millisecond, time.Millisecond
 	s.AddTool(taskTool("work"), func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		return mcp.NewToolResultText("superseded"), nil
+		return mcp.NewToolResultText("the outcome"), nil
 	})
 	id := startLegacyTask(t, s, "work")
-	<-store.attempts // the outcome is refused; the retry now waits an hour
-
-	// The store refuses the cancellation too: it is accepted, not an internal
-	// error, and nothing terminal is reported yet.
-	require.NoError(t, s.cancelTask(t.Context(), id, false), "the cancel is accepted, not an internal error")
-	rec := <-store.attempts // the cancel woke the retry, which tried the cancellation
-	assert.Equal(t, mcp.TaskStatusCancelled, rec.Task.Status, "the cancel replaces the pending outcome")
-	task, _, err := s.getTask(t.Context(), id)
-	require.NoError(t, err)
-	assert.Equal(t, mcp.TaskStatusWorking, task.Status, "not reported before it is stored")
-
+	<-store.attempts
+	err := s.cancelTask(t.Context(), id, false)
+	require.Error(t, err, "not acked: it could not be honoured")
+	assert.ErrorIs(t, err, errTaskStoreFailure)
 	close(store.open)
-	require.NoError(t, s.cancelTask(t.Context(), id, false)) // wakes the hour-long wait again
-	task = waitLocalTerminal(t, s, id)
-	assert.Equal(t, mcp.TaskStatusCancelled, task.Status)
-	rec, _ = store.Get(context.Background(), id)
-	assert.Equal(t, mcp.TaskStatusCancelled, rec.Task.Status, "store and memory agree")
+	task := waitLocalTerminal(t, s, id)
+	assert.Equal(t, mcp.TaskStatusCompleted, task.Status)
+	rec, _ := store.Get(context.Background(), id)
+	assert.Equal(t, mcp.TaskStatusCompleted, rec.Task.Status, "store and memory agree")
+}
+
+// StopTaskStore during a pending outcome leaves no waiter blocked and no
+// slot used, and reports nothing terminal (the store still has it running).
+func TestTaskStore_StopDuringPendingOutcome(t *testing.T) {
+	store := newGatedStore()
+	s := NewMCPServer("s", "1", WithTaskCapabilities(true, true, true), WithTaskStore(store), WithMaxConcurrentTasks(1))
+	s.taskStoreRetryMin, s.taskStoreRetryMax = time.Hour, time.Hour
+	s.AddTool(taskTool("work"), func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return mcp.NewToolResultText("unsaved"), nil
+	})
+	id := startLegacyTask(t, s, "work")
+	<-store.attempts
+	waiter := make(chan *requestError, 1)
+	go func() {
+		_, reqErr := s.handleTaskResult(context.Background(), 1, mcp.TaskResultRequest{Params: mcp.TaskResultParams{TaskId: id}})
+		waiter <- reqErr
+	}()
+	s.StopTaskStore()
+	select {
+	case reqErr := <-waiter:
+		require.NotNil(t, reqErr)
+		assert.Equal(t, mcp.INTERNAL_ERROR, reqErr.code)
+		assert.Contains(t, reqErr.err.Error(), "server is stopping")
+	case <-time.After(5 * time.Second):
+		t.Fatal("a tasks/result waiter is still blocked after StopTaskStore")
+	}
+	require.Eventually(t, func() bool {
+		s.tasksMu.RLock()
+		defer s.tasksMu.RUnlock()
+		return s.activeTasks == 0
+	}, 5*time.Second, time.Millisecond, "the slot is released")
+	rec, _ := store.Get(context.Background(), id)
+	assert.Equal(t, mcp.TaskStatusWorking, rec.Task.Status, "left running for the next server")
 }
 
 // StopTaskStore ends a retry that would otherwise wait for an hour.

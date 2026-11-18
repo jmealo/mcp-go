@@ -468,6 +468,9 @@ func (s *SSEServer) Start(addr string) error {
 // Shutdown gracefully stops the SSE server, closing all active sessions
 // and shutting down the HTTP server.
 func (s *SSEServer) Shutdown(ctx context.Context) error {
+	if s.server != nil {
+		s.server.StopTaskStore() // durable tasks: stop store retries and purge
+	}
 	s.mu.RLock()
 	srv := s.srv
 	s.mu.RUnlock()
