@@ -239,3 +239,36 @@ func buildModernContext(ctx context.Context, _ *MCPServer) context.Context {
 		},
 	})
 }
+
+// TestSEP2663_TaskPollIntervalSurfaced verifies WithTaskPollInterval is
+// carried on created tasks and tasks/get responses, in the SEP-2663 wire
+// field.
+func TestSEP2663_TaskPollIntervalSurfaced(t *testing.T) {
+	srv := NewMCPServer("test", "1.0.0",
+		WithTaskCapabilities(true, true, true),
+		WithTaskPollInterval(1200),
+	)
+	srv.AddTool(
+		mcp.NewTool("pollme", mcp.WithTaskSupport(mcp.TaskSupportOptional)),
+		func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("done"), nil
+		},
+	)
+
+	ctx := buildModernContext(t.Context(), srv)
+	result, reqErr := srv.handleToolCall(ctx, 2, mcp.CallToolRequest{Params: mcp.CallToolParams{Name: "pollme"}})
+	require.Nil(t, reqErr)
+	task, ok := result.(*mcp.CreateTaskResult)
+	require.True(t, ok, "got %T", result)
+	require.NotNil(t, task.Task.PollInterval)
+	assert.Equal(t, int64(1200), *task.Task.PollInterval)
+
+	wire, err := json.Marshal(task)
+	require.NoError(t, err)
+	assert.Contains(t, string(wire), `"pollIntervalMs":1200`)
+
+	got, reqErr := srv.handleGetTask(ctx, 3, mcp.GetTaskRequest{Params: mcp.GetTaskParams{TaskId: task.Task.TaskId}})
+	require.Nil(t, reqErr)
+	require.NotNil(t, got.PollInterval)
+	assert.Equal(t, int64(1200), *got.PollInterval)
+}

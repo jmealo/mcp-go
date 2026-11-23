@@ -315,6 +315,7 @@ type MCPServer struct {
 	expiredTasks                 map[string]time.Time // Tracks recently expired task IDs with expiration timestamp
 	maxConcurrentTasks           *int                 // Optional limit on concurrent running tasks
 	defaultTaskTTLMs             *int64               // Fallback TTL applied when client supplies none
+	defaultTaskPollIntervalMs    *int64               // Suggested poll interval advertised on created tasks
 	activeTasks                  int                  // Current count of running (non-terminal) tasks
 	inflightCancels              sync.Map             // Maps request ID -> context.CancelFunc for in-flight requests
 	inputValidator               *inputSchemaValidator
@@ -744,6 +745,18 @@ func WithDefaultTaskTTL(ttlMs int64) ServerOption {
 	return func(s *MCPServer) {
 		if ttlMs > 0 {
 			s.defaultTaskTTLMs = &ttlMs
+		}
+	}
+}
+
+// WithTaskPollInterval sets a suggested polling interval (milliseconds)
+// included in every task the server creates, so clients that honor
+// pollIntervalMs (which the Tasks specification recommends) pace themselves
+// instead of polling at their own default rate.
+func WithTaskPollInterval(pollIntervalMs int64) ServerOption {
+	return func(s *MCPServer) {
+		if pollIntervalMs > 0 {
+			s.defaultTaskPollIntervalMs = &pollIntervalMs
 		}
 	}
 }
@@ -2572,8 +2585,9 @@ func (s *MCPServer) handleTaskAugmentedToolCall(
 		ttl = s.defaultTaskTTLMs
 	}
 
-	// Create task entry (pollInterval is nil - server doesn't set a default)
-	entry, err := s.createTaskFor(ctx, taskID, request.Params.Name, ttl, nil, &request)
+	// Suggest the server-configured polling interval when one is set, so
+	// clients that honor pollIntervalMs pace themselves.
+	entry, err := s.createTaskFor(ctx, taskID, request.Params.Name, ttl, s.defaultTaskPollIntervalMs, &request)
 	if err != nil {
 		return nil, &requestError{
 			id:   id,
