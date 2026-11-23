@@ -1,6 +1,6 @@
 package server
 
-// Review-only interop validation for PR #987 (SEP-2663 tasks extension).
+// Interop validation for the SEP-2663 tasks extension.
 //
 // Part A models the March 2026 Claude Code client exactly as observed in the
 // leaked source (src/services/mcp/client.ts): initialize with
