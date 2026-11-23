@@ -64,6 +64,14 @@ type Client struct {
 	// manualInputRoundTrips leaves input-required results to the caller.
 	manualInputRoundTrips bool
 
+	// taskResolution drives task handles (SEP-2663) returned by tools/call to
+	// their final result inside CallTool instead of surfacing
+	// UnsupportedTaskResultError.
+	taskResolution bool
+
+	// taskInputHandler answers input_required rounds during task resolution.
+	taskInputHandler TaskInputHandlerFunc
+
 	// discoverTimeout bounds the server/discover probe sent during Initialize.
 	discoverTimeout time.Duration
 
@@ -159,6 +167,28 @@ func WithMaxInputRoundTrips(limit int) ClientOption {
 func WithManualInputRoundTrips() ClientOption {
 	return func(c *Client) {
 		c.manualInputRoundTrips = true
+	}
+}
+
+// WithTaskResolution makes CallTool drive task handles from the Tasks
+// extension (SEP-2663) to completion: a tools/call answered with
+// resultType:"task" is polled internally and the final CallToolResult is
+// returned, as the specification advises for clients with a fixed result
+// shape. Without this option such answers surface as
+// [*mcp.UnsupportedTaskResultError]. Enabling it also declares the
+// io.modelcontextprotocol/tasks extension in this client's capabilities.
+func WithTaskResolution() ClientOption {
+	return func(c *Client) {
+		c.taskResolution = true
+	}
+}
+
+// WithTaskInputHandler registers the handler answering a task's
+// inputRequests during task resolution, invoked when a driven task parks in
+// input_required.
+func WithTaskInputHandler(h TaskInputHandlerFunc) ClientOption {
+	return func(c *Client) {
+		c.taskInputHandler = h
 	}
 }
 
@@ -761,12 +791,19 @@ func (c *Client) CallTool(
 ) (*mcp.CallToolResult, error) {
 	request.Params.Meta = c.injectMeta(ctx, request.Params.Meta)
 	header := outboundHeader(request.Header, request.Method)
-	return multiRoundTrip(ctx, c, request.Params.MultiRoundTripParams,
+	result, err := multiRoundTrip(ctx, c, request.Params.MultiRoundTripParams,
 		func(ctx context.Context, roundTrip mcp.MultiRoundTripParams) (*mcp.CallToolResult, error) {
 			return c.callToolOnce(ctx, request, roundTrip, header)
 		},
 		callToolNeedsInput,
 	)
+	// A server-directed task handle (SEP-2663). Drive it to the final result
+	// when the caller opted in; otherwise the typed error reaches them.
+	var taskHandle *mcp.UnsupportedTaskResultError
+	if err != nil && c.taskResolution && errors.As(err, &taskHandle) {
+		return c.ResolveTask(ctx, taskHandle.TaskID)
+	}
+	return result, err
 }
 
 // SetLevel sets the minimum severity of log messages the server should send.

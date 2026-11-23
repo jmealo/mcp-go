@@ -69,6 +69,16 @@ func (c *Client) effectiveCapabilities() mcp.ClientCapabilities {
 	if c.elicitationHandler != nil && capabilities.Elicitation == nil {
 		capabilities.Elicitation = &mcp.ElicitationCapability{}
 	}
+	// Task resolution is the handler for the Tasks extension: opting in
+	// declares the extension so servers may create tasks for this client.
+	if c.taskResolution {
+		if capabilities.Extensions == nil {
+			capabilities.Extensions = map[string]any{}
+			capabilities.Extensions[mcp.ExtensionTasks] = map[string]any{}
+		} else if _, declared := capabilities.Extensions[mcp.ExtensionTasks]; !declared {
+			capabilities.Extensions[mcp.ExtensionTasks] = map[string]any{}
+		}
+	}
 	return capabilities
 }
 
