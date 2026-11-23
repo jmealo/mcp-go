@@ -2894,7 +2894,6 @@ func (s *MCPServer) awaitTaskInput(
 	case <-entry.inputReady:
 	default:
 	}
-	task := entry.task
 	s.tasksMu.Unlock()
 
 	if err := s.persistLocalState(taskCtx, entry); err != nil {
@@ -2903,7 +2902,7 @@ func (s *MCPServer) awaitTaskInput(
 		}
 		return nil, false
 	}
-	s.sendTaskStatusNotification(task, entry.modernTask)
+	s.sendTaskStatusNotification(entry)
 
 	select {
 	case <-entry.inputReady:
@@ -2930,7 +2929,6 @@ func (s *MCPServer) awaitTaskInput(
 			entry.request = raw
 		}
 	}
-	task = entry.task
 	s.tasksMu.Unlock()
 
 	if nextErr != nil {
@@ -2943,7 +2941,7 @@ func (s *MCPServer) awaitTaskInput(
 		}
 		return nil, false
 	}
-	s.sendTaskStatusNotification(task, entry.modernTask)
+	s.sendTaskStatusNotification(entry)
 	return responses, true
 }
 
@@ -3017,38 +3015,16 @@ func (s *MCPServer) handleGetTask(
 			return nil, taskLookupError(id, err)
 		}
 
-		s.tasksMu.RLock()
-		taskCopy := entry.task
-		storedResult := entry.result
-		resultErr := entry.resultErr
-		pendingInputRequests := entry.inputRequests
-		s.tasksMu.RUnlock()
-
-		result := mcp.NewGetTaskResult(taskCopy)
-		result.SetResultType(mcp.ResultTypeComplete)
-
-		switch taskCopy.Status {
-		case mcp.TaskStatusCompleted:
-			if storedResult != nil {
-				raw, marshalErr := json.Marshal(storedResult)
-				if marshalErr != nil {
-					// The result cannot be encoded. Report it as a task error
-					// rather than returning a successful but empty result,
-					// which would silently drop the tool output.
-					return nil, &requestError{
-						id:   id,
-						code: mcp.INTERNAL_ERROR,
-						err:  fmt.Errorf("task %q result is not JSON-encodable: %w", request.Params.TaskId, marshalErr),
-					}
-				}
-				result.TaskResult = json.RawMessage(raw)
+		result, snapshotErr := s.detailedTaskSnapshot(entry)
+		if snapshotErr != nil {
+			// The result cannot be encoded. Report it as a task error
+			// rather than returning a successful but empty result,
+			// which would silently drop the tool output.
+			return nil, &requestError{
+				id:   id,
+				code: mcp.INTERNAL_ERROR,
+				err:  fmt.Errorf("task %q result is not JSON-encodable: %w", request.Params.TaskId, snapshotErr),
 			}
-		case mcp.TaskStatusFailed:
-			if resultErr != nil {
-				result.TaskError = taskErrorDetails(resultErr)
-			}
-		case mcp.TaskStatusInputRequired:
-			result.InputRequests = pendingInputRequests
 		}
 
 		return &result, nil
@@ -3750,7 +3726,7 @@ func (s *MCPServer) commitComplete(entry *taskEntry, result any, err error) {
 	s.tasksMu.Unlock()
 
 	// Send task status notification
-	s.sendTaskStatusNotification(task, entry.modernTask)
+	s.sendTaskStatusNotification(entry)
 
 	// Fire task hooks, after the created hook if it is still running
 	if s.taskHooks != nil {
@@ -3891,7 +3867,7 @@ func (s *MCPServer) commitCancel(ctx context.Context, entry *taskEntry, message 
 	if cancel != nil {
 		cancel()
 	}
-	s.sendTaskStatusNotification(task, entry.modernTask)
+	s.sendTaskStatusNotification(entry)
 	if s.taskHooks != nil {
 		// After the created hook, if it is still running.
 		s.fireTaskHook(ctx, entry, func(ctx context.Context) { s.taskHooks.taskCancelled(ctx, metrics) })
@@ -3937,13 +3913,15 @@ func (s *MCPServer) scheduleTaskCleanup(taskID string, expected *taskEntry, ttlM
 }
 
 // sendTaskStatusNotification sends a notification when a task's status changes.
-func (s *MCPServer) sendTaskStatusNotification(task mcp.Task, modernTask bool) {
-	// Don't broadcast modern tasks, this fans out to every session with no
-	// origin filtering, so the task id would leak its bearer handle. Modern
-	// clients poll tasks/get instead.
-	if modernTask {
+// Legacy tasks broadcast to every client; modern (SEP-2663) tasks are pushed
+// only to sessions that subscribed to the task's ID via subscriptions/listen,
+// because a task ID is a bearer handle an untargeted broadcast would leak.
+func (s *MCPServer) sendTaskStatusNotification(entry *taskEntry) {
+	if entry.modernTask {
+		s.notifyTaskSubscribers(entry)
 		return
 	}
+	task := entry.task
 
 	// Convert task to map[string]any for notification params
 	taskMap := map[string]any{

@@ -55,20 +55,19 @@ type SubscriptionFilter struct {
 	// TaskIds opts in to notifications/tasks for the listed task IDs
 	// (SEP-2663). Requesting it requires the io.modelcontextprotocol/tasks
 	// extension to be declared on the request; the server gates on it in
-	// handleSubscriptionsListen. Servers that do not push notifications/tasks
-	// simply omit the field from the acknowledged filter.
+	// handleSubscriptionsListen. Task subscriptions a server cannot serve
+	// (no task capability) are omitted from the acknowledged filter.
 	TaskIds []string `json:"taskIds,omitempty"`
 }
 
-// IsEmpty reports whether the filter opts in to anything this server can
-// deliver on a subscriptions/listen stream. TaskIds does not participate: it
-// is a request-side opt-in that the server intersects separately, and a
-// server that never pushes notifications/tasks establishes nothing for it.
+// IsEmpty reports whether the filter requests no notifications the server
+// agreed to serve, including task subscriptions.
 func (f SubscriptionFilter) IsEmpty() bool {
 	return !f.ToolsListChanged &&
 		!f.PromptsListChanged &&
 		!f.ResourcesListChanged &&
-		len(f.ResourceSubscriptions) == 0
+		len(f.ResourceSubscriptions) == 0 &&
+		len(f.TaskIds) == 0
 }
 
 // SubscriptionsListenRequest opens a long-lived stream for receiving

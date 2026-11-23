@@ -202,6 +202,12 @@ func (s *MCPServer) allowedSubscriptions(want mcp.SubscriptionFilter) mcp.Subscr
 	if len(want.ResourceSubscriptions) > 0 && s.capabilities.resources != nil && s.capabilities.resources.subscribe {
 		allowed.ResourceSubscriptions = append([]string(nil), want.ResourceSubscriptions...)
 	}
+	// Task notifications are agreed when the server runs tasks at all; the
+	// tasks extension capability gate has already rejected non-declaring
+	// requesters upstream in handleSubscriptionsListen.
+	if len(want.TaskIds) > 0 && s.capabilities.tasks != nil {
+		allowed.TaskIds = append([]string(nil), want.TaskIds...)
+	}
 	return allowed
 }
 
