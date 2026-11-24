@@ -271,7 +271,7 @@ func waitForTaskTerminal(t *testing.T, srv *MCPServer, ctx context.Context, task
 	deadline := time.Now().Add(2 * time.Second)
 	var status mcp.TaskStatus
 	for time.Now().Before(deadline) {
-		task, _, err := srv.getTask(ctx, taskID)
+		task, _, err := srv.getTask(ctx, taskID, TaskOpGet)
 		require.NoError(t, err)
 		status = task.Status
 		if status.IsTerminal() {

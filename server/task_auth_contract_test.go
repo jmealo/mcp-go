@@ -37,7 +37,7 @@ func TestTaskAccessControlContract(t *testing.T) {
 		entry, err := s.createTask(ctx, "task-match", "tool", nil, nil)
 		require.NoError(t, err)
 
-		_, _, err = s.getTask(ctx, entry.task.TaskId)
+		_, _, err = s.getTask(ctx, entry.task.TaskId, TaskOpGet)
 		assert.NoError(t, err, "same session should be allowed to access its own task")
 	})
 
@@ -49,7 +49,7 @@ func TestTaskAccessControlContract(t *testing.T) {
 		entry, err := s.createTask(ctxA, "task-mismatch", "tool", nil, nil)
 		require.NoError(t, err)
 
-		_, _, err = s.getTask(ctxB, entry.task.TaskId)
+		_, _, err = s.getTask(ctxB, entry.task.TaskId, TaskOpGet)
 		assert.EqualError(t, err, "task not found",
 			"different session should be denied — returned as not-found to avoid enumeration")
 	})
@@ -63,7 +63,7 @@ func TestTaskAccessControlContract(t *testing.T) {
 
 		// A session-bearing request can still access it via task ID alone.
 		ctxB := sessionCtx(t, s, "session-B")
-		_, _, err = s.getTask(ctxB, entry.task.TaskId)
+		_, _, err = s.getTask(ctxB, entry.task.TaskId, TaskOpGet)
 		assert.NoError(t, err,
 			"session-less task is bearer-token accessible: any caller who knows the ID may access it")
 	})
@@ -77,7 +77,7 @@ func TestTaskAccessControlContract(t *testing.T) {
 		assert.Equal(t, "session-A", entry.sessionID)
 
 		// A session-less request (stdio, in-process) can access any task by ID.
-		_, _, err = s.getTask(t.Context(), entry.task.TaskId)
+		_, _, err = s.getTask(t.Context(), entry.task.TaskId, TaskOpGet)
 		assert.NoError(t, err,
 			"session-less request uses bearer-token model: task ID possession grants access")
 	})
@@ -90,10 +90,10 @@ func TestTaskAccessControlContract(t *testing.T) {
 		entry, err := s.createTask(ctxA, "task-entry-policy", "tool", nil, nil)
 		require.NoError(t, err)
 
-		_, err = s.getTaskEntry(ctxA, entry.task.TaskId)
+		_, err = s.getTaskEntry(ctxA, entry.task.TaskId, TaskOpGet)
 		assert.NoError(t, err, "owner session: allowed")
 
-		_, err = s.getTaskEntry(ctxB, entry.task.TaskId)
+		_, err = s.getTaskEntry(ctxB, entry.task.TaskId, TaskOpGet)
 		assert.EqualError(t, err, "task not found", "different session: denied")
 	})
 }

@@ -158,7 +158,7 @@ func TestTaskToolTracerBullet(t *testing.T) {
 		assert.Equal(t, int64(60000), *createTaskResult.Task.TTL)
 
 		// Step 7: Verify task is in working state and can be retrieved
-		task, _, getErr := server.getTask(sessionCtx, taskID)
+		task, _, getErr := server.getTask(sessionCtx, taskID, TaskOpGet)
 		require.NoError(t, getErr, "Should be able to get task")
 		assert.Equal(t, taskID, task.TaskId)
 		assert.Equal(t, mcp.TaskStatusWorking, task.Status)
@@ -166,7 +166,7 @@ func TestTaskToolTracerBullet(t *testing.T) {
 		// Step 8: Wait for task to complete (poll tasks/get)
 		var taskStatus mcp.TaskStatus
 		for range 30 {
-			task, _, err := server.getTask(sessionCtx, taskID)
+			task, _, err := server.getTask(sessionCtx, taskID, TaskOpGet)
 			require.NoError(t, err, "getTask should succeed")
 
 			taskStatus = task.Status
@@ -377,7 +377,7 @@ func TestTaskToolTracerBullet(t *testing.T) {
 
 		// Wait for completion
 		for range 20 {
-			task, _, err := server.getTask(ctx, taskID)
+			task, _, err := server.getTask(ctx, taskID, TaskOpGet)
 			require.NoError(t, err)
 			if task.Status.IsTerminal() {
 				break
@@ -459,7 +459,7 @@ func TestTaskToolTracerBullet(t *testing.T) {
 		}
 
 		// Step 5: Verify task status is cancelled
-		task, _, err := server.getTask(ctx, taskID)
+		task, _, err := server.getTask(ctx, taskID, TaskOpGet)
 		require.NoError(t, err)
 		assert.Equal(t, mcp.TaskStatusCancelled, task.Status)
 	})
@@ -503,7 +503,7 @@ func TestTaskToolTracerBullet(t *testing.T) {
 		// Wait for task to complete (should fail)
 		var taskObj mcp.Task
 		for range 20 {
-			taskResult, _, err := server.getTask(ctx, taskID)
+			taskResult, _, err := server.getTask(ctx, taskID, TaskOpGet)
 			require.NoError(t, err)
 			taskObj = taskResult
 			if taskObj.Status.IsTerminal() {
@@ -575,7 +575,7 @@ func TestTaskToolTracerBullet(t *testing.T) {
 		// Wait for task to reach a terminal state.
 		var finalTask mcp.Task
 		for range 20 {
-			task, _, err := server.getTask(t.Context(), taskID)
+			task, _, err := server.getTask(t.Context(), taskID, TaskOpGet)
 			require.NoError(t, err)
 			finalTask = task
 			if task.Status.IsTerminal() {
@@ -637,7 +637,7 @@ func TestTaskToolTracerBullet(t *testing.T) {
 		// Step 4: Wait for all tasks to complete
 		for _, taskID := range taskIDs {
 			for range 20 {
-				task, _, err := server.getTask(ctx, taskID)
+				task, _, err := server.getTask(ctx, taskID, TaskOpGet)
 				require.NoError(t, err)
 				if task.Status.IsTerminal() {
 					break

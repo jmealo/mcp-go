@@ -60,6 +60,10 @@ type TaskRecord struct {
 	DeliveredInputKeys []string `json:"deliveredInputKeys,omitempty"`
 	// Owner identifies the server that last created or claimed the task.
 	Owner string `json:"owner,omitempty"`
+	// OwnerID is the opaque identity of the caller that created the task,
+	// set by WithTaskOwner and read by a WithTaskAuthorizer hook. Unlike
+	// Owner it is stable across server instances and restarts.
+	OwnerID string `json:"ownerId,omitempty"`
 	// Revision is set by the store: 1 on Create, +1 on each Update. Update
 	// succeeds only when the caller's Revision equals the stored one.
 	Revision uint64 `json:"revision"`

@@ -66,7 +66,7 @@ func TestTaskStore_ResumeClaimsOwnership(t *testing.T) {
 	_, aHolds := a.tasks[id]
 	a.tasksMu.RUnlock()
 	assert.False(t, aHolds, "A dropped its entry")
-	task, _, err := a.getTask(t.Context(), id)
+	task, _, err := a.getTask(t.Context(), id, TaskOpGet)
 	require.NoError(t, err)
 	assert.Equal(t, mcp.TaskStatusWorking, task.Status, "A now serves the task from the store")
 }
@@ -111,7 +111,7 @@ func TestTaskStore_UnsavedOutcomeIsRetriedNotReported(t *testing.T) {
 	id := startLegacyTask(t, s, "work")
 	<-store.attempts
 	<-store.attempts // refused twice: still unsaved while we look
-	task, _, err := s.getTask(t.Context(), id)
+	task, _, err := s.getTask(t.Context(), id, TaskOpGet)
 	require.NoError(t, err)
 	assert.Equal(t, mcp.TaskStatusWorking, task.Status, "not reported before it is stored")
 	rec, _ := store.Get(context.Background(), id)

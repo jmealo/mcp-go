@@ -127,7 +127,7 @@ func TestSEP2663_GetTaskInlinesResult(t *testing.T) {
 
 	// Wait for completion
 	for range 100 {
-		t, _, _ := srv.getTask(modernCtx, "task-inline")
+		t, _, _ := srv.getTask(modernCtx, "task-inline", TaskOpGet)
 		if t.Status.IsTerminal() {
 			break
 		}

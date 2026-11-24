@@ -86,7 +86,7 @@ func TestTaskHookMetricsRemainEventSnapshotsDuringConcurrentCompletion(t *testin
 		require.True(t, events[1].Status.IsTerminal())
 		require.Nil(t, events[0].CompletedAt)
 		require.NotNil(t, events[1].CompletedAt)
-		task, _, err := s.getTask(t.Context(), id)
+		task, _, err := s.getTask(t.Context(), id, TaskOpGet)
 		require.NoError(t, err)
 		require.Equal(t, task.Status, events[1].Status)
 	}

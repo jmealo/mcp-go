@@ -318,11 +318,11 @@ func TestTaskInputRequired_LegacyFailsCleanly(t *testing.T) {
 
 	// The task must reach failed (not input_required).
 	require.Eventually(t, func() bool {
-		task, _, err := srv.getTask(ctx, taskID)
+		task, _, err := srv.getTask(ctx, taskID, TaskOpGet)
 		return err == nil && task.Status == mcp.TaskStatusFailed
 	}, 5*time.Second, 10*time.Millisecond)
 
-	task, _, err := srv.getTask(ctx, taskID)
+	task, _, err := srv.getTask(ctx, taskID, TaskOpGet)
 	require.NoError(t, err)
 	assert.Equal(t, mcp.TaskStatusFailed, task.Status)
 	assert.Contains(t, task.StatusMessage, "legacy task execution")
@@ -427,7 +427,7 @@ func TestTaskModern_IgnoresLegacyTaskParam(t *testing.T) {
 	require.Nil(t, reqErr)
 	taskID := created.(*mcp.CreateTaskResult).Task.TaskId
 
-	task, _, err := srv.getTask(ctx, taskID)
+	task, _, err := srv.getTask(ctx, taskID, TaskOpGet)
 	require.NoError(t, err)
 	require.NotNil(t, task.TTL)
 	assert.Equal(t, serverDefault, *task.TTL,
@@ -532,11 +532,11 @@ func TestTaskInputRequired_EmptyRequestsFailsFast(t *testing.T) {
 
 	// Must reach failed, not park in input_required.
 	require.Eventually(t, func() bool {
-		task, _, err := srv.getTask(ctx, taskID)
+		task, _, err := srv.getTask(ctx, taskID, TaskOpGet)
 		return err == nil && task.Status == mcp.TaskStatusFailed
 	}, 5*time.Second, 10*time.Millisecond)
 
-	task, _, err := srv.getTask(ctx, taskID)
+	task, _, err := srv.getTask(ctx, taskID, TaskOpGet)
 	require.NoError(t, err)
 	assert.Equal(t, mcp.TaskStatusFailed, task.Status)
 	assert.Contains(t, task.StatusMessage, "no input requests")
@@ -558,15 +558,15 @@ func TestTaskCrossOriginIsolation(t *testing.T) {
 	require.NoError(t, err)
 
 	// Legacy caller: getTask must not reach the modern task, but reaches its own.
-	_, _, err = srv.getTask(legacyCtx, "modern-task")
+	_, _, err = srv.getTask(legacyCtx, "modern-task", TaskOpGet)
 	assert.Error(t, err, "legacy caller must not access a modern-origin task")
-	_, _, err = srv.getTask(legacyCtx, "legacy-task")
+	_, _, err = srv.getTask(legacyCtx, "legacy-task", TaskOpGet)
 	assert.NoError(t, err, "legacy caller must access its own task")
 
 	// Modern caller: the reverse.
-	_, _, err = srv.getTask(modernCtx, "legacy-task")
+	_, _, err = srv.getTask(modernCtx, "legacy-task", TaskOpGet)
 	assert.Error(t, err, "modern caller must not access a legacy-origin task")
-	_, _, err = srv.getTask(modernCtx, "modern-task")
+	_, _, err = srv.getTask(modernCtx, "modern-task", TaskOpGet)
 	assert.NoError(t, err, "modern caller must access its own task")
 
 	// Legacy tasks/list must enumerate only legacy-origin tasks.

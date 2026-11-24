@@ -52,7 +52,7 @@ func waitLocalTerminal(t *testing.T, s *MCPServer, id string) mcp.Task {
 	t.Helper()
 	var task mcp.Task
 	require.Eventually(t, func() bool {
-		tk, _, err := s.getTask(context.Background(), id)
+		tk, _, err := s.getTask(context.Background(), id, TaskOpGet)
 		task = tk
 		return err == nil && tk.Status.IsTerminal()
 	}, 5*time.Second, 5*time.Millisecond)
@@ -106,7 +106,7 @@ func TestTaskStore_RestartResumesTask(t *testing.T) {
 	close(releaseA)
 	<-aDone
 	require.Eventually(t, func() bool {
-		tk, _, err := a.getTask(context.Background(), id)
+		tk, _, err := a.getTask(context.Background(), id, TaskOpGet)
 		return err == nil && tk.Status.IsTerminal()
 	}, 5*time.Second, 5*time.Millisecond)
 	rec, err := store.Get(context.Background(), id)
@@ -222,7 +222,7 @@ func TestTaskStore_CancelFromAnotherServer(t *testing.T) {
 	id := startLegacyTask(t, a, "work")
 
 	b := durableServer(store)
-	task, _, err := b.getTask(t.Context(), id)
+	task, _, err := b.getTask(t.Context(), id, TaskOpGet)
 	require.NoError(t, err)
 	assert.Equal(t, mcp.TaskStatusWorking, task.Status, "B reads A's running task from the store")
 	require.NoError(t, b.cancelTask(t.Context(), id, false))
@@ -320,14 +320,14 @@ func TestTaskStore_RefusedResultIsNeverReported(t *testing.T) {
 		defer store.mu.Unlock()
 		return store.failures >= 3
 	}, 5*time.Second, time.Millisecond, "the outcome is retried")
-	task, _, err := s.getTask(t.Context(), id)
+	task, _, err := s.getTask(t.Context(), id, TaskOpGet)
 	require.NoError(t, err)
 	assert.Equal(t, mcp.TaskStatusWorking, task.Status)
 	rec, err := store.Get(context.Background(), id)
 	require.NoError(t, err)
 	assert.Equal(t, mcp.TaskStatusWorking, rec.Task.Status, "memory and store agree")
 	require.Eventually(t, func() bool {
-		_, _, err := s.getTask(context.Background(), id)
+		_, _, err := s.getTask(context.Background(), id, TaskOpGet)
 		return err != nil
 	}, 5*time.Second, 5*time.Millisecond, "the task expires and the retries stop")
 }
@@ -359,6 +359,6 @@ func TestTaskStore_ExpiryDeletesRecord(t *testing.T) {
 		_, err := store.Get(context.Background(), id)
 		return errors.Is(err, ErrTaskNotFound)
 	}, 5*time.Second, 5*time.Millisecond)
-	_, _, err := s.getTask(t.Context(), id)
+	_, _, err := s.getTask(t.Context(), id, TaskOpGet)
 	assert.ErrorContains(t, err, "expired")
 }

@@ -184,7 +184,7 @@ func TestTaskNilResultFailsTheTask(t *testing.T) {
 			assert.Equal(t, mcp.INTERNAL_ERROR, reqErr.code)
 			assert.EqualError(t, reqErr.err, "tool 'broken' handler returned no result")
 
-			task, _, err := srv.getTask(t.Context(), taskID)
+			task, _, err := srv.getTask(t.Context(), taskID, TaskOpGet)
 			require.NoError(t, err)
 			assert.Equal(t, mcp.TaskStatusFailed, task.Status)
 		})

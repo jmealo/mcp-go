@@ -118,7 +118,7 @@ func TestMCPServer_TaskLifecycle(t *testing.T) {
 	assert.Equal(t, int64(60000), *entry.task.TTL)
 
 	// Get task
-	retrievedTask, _, err := server.getTask(ctx, "task-123")
+	retrievedTask, _, err := server.getTask(ctx, "task-123", TaskOpGet)
 	require.NoError(t, err)
 	assert.Equal(t, "task-123", retrievedTask.TaskId)
 
@@ -369,19 +369,19 @@ func TestMCPServer_TaskTTLCleanup(t *testing.T) {
 	require.NoError(t, err)
 
 	// Task should exist initially
-	_, _, getErr := server.getTask(ctx, "task-ttl")
+	_, _, getErr := server.getTask(ctx, "task-ttl", TaskOpGet)
 	require.NoError(t, getErr)
 
 	// Wait for TTL to expire
 	time.Sleep(150 * time.Millisecond)
 
 	// Task should be cleaned up and return "expired" error
-	_, _, err = server.getTask(ctx, "task-ttl")
+	_, _, err = server.getTask(ctx, "task-ttl", TaskOpGet)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "task has expired")
 
 	// A task that never existed should return "not found" error
-	_, _, err = server.getTask(ctx, "never-existed")
+	_, _, err = server.getTask(ctx, "never-existed", TaskOpGet)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "task not found")
 }
@@ -404,11 +404,11 @@ func TestMCPServer_TaskExpiredVsNotFoundErrors(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 
 		// All task operations should return "expired" error
-		_, _, err = server.getTask(ctx, "task-expired")
+		_, _, err = server.getTask(ctx, "task-expired", TaskOpGet)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "task has expired")
 
-		_, err = server.getTaskEntry(ctx, "task-expired")
+		_, err = server.getTaskEntry(ctx, "task-expired", TaskOpGet)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "task has expired")
 
@@ -419,12 +419,12 @@ func TestMCPServer_TaskExpiredVsNotFoundErrors(t *testing.T) {
 
 	t.Run("non-existent task returns 'task not found' error", func(t *testing.T) {
 		// Task that never existed
-		_, _, err := server.getTask(ctx, "never-existed")
+		_, _, err := server.getTask(ctx, "never-existed", TaskOpGet)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "task not found")
 		assert.NotContains(t, err.Error(), "expired")
 
-		_, err = server.getTaskEntry(ctx, "never-existed")
+		_, err = server.getTaskEntry(ctx, "never-existed", TaskOpGet)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "task not found")
 		assert.NotContains(t, err.Error(), "expired")
@@ -1749,7 +1749,7 @@ func TestTaskResultEndToEnd(t *testing.T) {
 	// Step 2: Wait for task to complete (poll tasks/get)
 	var taskStatus mcp.TaskStatus
 	for range 20 {
-		task, _, err := server.getTask(ctx, taskID)
+		task, _, err := server.getTask(ctx, taskID, TaskOpGet)
 		require.NoError(t, err, "getTask should succeed")
 
 		taskStatus = task.Status

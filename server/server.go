@@ -76,6 +76,9 @@ type taskEntry struct {
 	remote bool
 	// owner is a remote entry's stored Owner.
 	owner string
+	// ownerID is the caller identity recorded at creation (WithTaskOwner);
+	// authorizers compare it against the requesting caller.
+	ownerID string
 	// dropped marks a local entry whose task another server took over.
 	dropped bool
 	// outcomePending is set while the task's outcome is being stored; a
@@ -303,8 +306,10 @@ type MCPServer struct {
 	hooks                        *Hooks
 	taskHooks                    *TaskHooks
 	tasks                        map[string]*taskEntry
-	taskStore                    TaskStore // nil: tasks live only in this process
-	taskOwner                    string    // this server's Owner in task records
+	taskStore                    TaskStore          // nil: tasks live only in this process
+	taskOwner                    string             // this server's Owner in task records
+	taskOwnerIDFn                TaskOwnerFunc      // records the creating caller's identity on tasks
+	taskAuthorizer               TaskAuthorizerFunc // gates task operations after decode+load
 	taskStoreRetryMin            time.Duration
 	taskStoreRetryMax            time.Duration
 	taskPurgeInterval            time.Duration
@@ -3024,7 +3029,7 @@ func (s *MCPServer) handleGetTask(
 ) (*mcp.GetTaskResult, *requestError) {
 	// For modern protocol (SEP-2663).
 	if IsModernRequest(ctx) {
-		entry, err := s.getTaskEntry(ctx, request.Params.TaskId)
+		entry, err := s.getTaskEntry(ctx, request.Params.TaskId, TaskOpGet)
 		if err != nil {
 			return nil, taskLookupError(id, err)
 		}
@@ -3045,7 +3050,7 @@ func (s *MCPServer) handleGetTask(
 	}
 
 	// Legacy path: return task state only.
-	task, _, err := s.getTask(ctx, request.Params.TaskId)
+	task, _, err := s.getTask(ctx, request.Params.TaskId, TaskOpGet)
 	if err != nil {
 		return nil, taskLookupError(id, err)
 	}
@@ -3061,7 +3066,7 @@ func (s *MCPServer) handleUpdateTask(
 	id any,
 	request mcp.UpdateTaskRequest,
 ) (*mcp.UpdateTaskResult, *requestError) {
-	entry, err := s.getTaskEntry(ctx, request.Params.TaskId)
+	entry, err := s.getTaskEntry(ctx, request.Params.TaskId, TaskOpUpdate)
 	if err != nil {
 		return nil, taskLookupError(id, err)
 	}
@@ -3161,7 +3166,7 @@ func (s *MCPServer) handleTaskResult(
 	id any,
 	request mcp.TaskResultRequest,
 ) (*mcp.TaskResultResult, *requestError) {
-	task, done, err := s.getTask(ctx, request.Params.TaskId)
+	task, done, err := s.getTask(ctx, request.Params.TaskId, TaskOpResult)
 	if err != nil {
 		return nil, taskLookupError(id, err)
 	}
@@ -3194,7 +3199,7 @@ func (s *MCPServer) handleTaskResult(
 			}
 		}
 		// Re-fetch the task entry to get the final result/error under lock
-		entry, err = s.getTaskEntry(ctx, request.Params.TaskId)
+		entry, err = s.getTaskEntry(ctx, request.Params.TaskId, TaskOpResult)
 		if err != nil {
 			return nil, taskLookupError(id, err)
 		}
@@ -3289,7 +3294,7 @@ func (s *MCPServer) handleCancelTask(
 	}
 
 	// Legacy: return the cancelled task state.
-	task, _, err := s.getTask(ctx, request.Params.TaskId)
+	task, _, err := s.getTask(ctx, request.Params.TaskId, TaskOpCancel)
 	if err != nil {
 		return nil, taskLookupError(id, err)
 	}
@@ -3386,6 +3391,9 @@ func (s *MCPServer) createTaskFor(ctx context.Context, taskID string, toolName s
 		modernTask: IsModernRequest(ctx),
 		done:       make(chan struct{}),
 		inputReady: make(chan struct{}, 1),
+	}
+	if s.taskOwnerIDFn != nil {
+		entry.ownerID = s.taskOwnerIDFn(ctx)
 	}
 	if info := RequestProtocolInfoFromContext(ctx); info != nil {
 		p := *info
@@ -3499,7 +3507,7 @@ func (s *MCPServer) fireTaskHook(ctx context.Context, entry *taskEntry, fire fun
 
 // getTask retrieves a task by ID, checking session isolation if applicable.
 // Returns a copy of the task and the done channel for waiting on completion.
-func (s *MCPServer) getTask(ctx context.Context, taskID string) (mcp.Task, chan struct{}, error) {
+func (s *MCPServer) getTask(ctx context.Context, taskID string, op TaskOp) (mcp.Task, chan struct{}, error) {
 	s.tasksMu.RLock()
 	entry, exists := s.tasks[taskID]
 	if !exists {
@@ -3538,11 +3546,17 @@ func (s *MCPServer) getTask(ctx context.Context, taskID string) (mcp.Task, chan 
 	done := entry.done
 	s.tasksMu.RUnlock()
 
+	// Application authorization runs after the lock: a denial is
+	// indistinguishable from the task not existing.
+	if err := s.authorizeTask(ctx, op, entry); err != nil {
+		return mcp.Task{}, nil, err
+	}
+
 	return taskCopy, done, nil
 }
 
 // getTaskEntry retrieves the raw task entry for internal use (requires caller to handle synchronization).
-func (s *MCPServer) getTaskEntry(ctx context.Context, taskID string) (*taskEntry, error) {
+func (s *MCPServer) getTaskEntry(ctx context.Context, taskID string, op TaskOp) (*taskEntry, error) {
 	s.tasksMu.RLock()
 	entry, exists := s.tasks[taskID]
 	if !exists {
@@ -3574,6 +3588,12 @@ func (s *MCPServer) getTaskEntry(ctx context.Context, taskID string) (*taskEntry
 	sessionID := getSessionID(ctx)
 	if entry.sessionID != "" && sessionID != "" && entry.sessionID != sessionID {
 		return nil, fmt.Errorf("task not found")
+	}
+
+	// Application authorization, on the decoded request and loaded record.
+	// A denial is indistinguishable from the task not existing.
+	if err := s.authorizeTask(ctx, op, entry); err != nil {
+		return nil, err
 	}
 
 	return entry, nil
@@ -3757,7 +3777,7 @@ func (s *MCPServer) commitComplete(entry *taskEntry, result any, err error) {
 // cancelTask cancels a running task. When rejectTerminal is set (legacy path),
 // cancelling an already-terminal task fails with an error instead of acking.
 func (s *MCPServer) cancelTask(ctx context.Context, taskID string, rejectTerminal bool) error {
-	entry, err := s.getTaskEntry(ctx, taskID)
+	entry, err := s.getTaskEntry(ctx, taskID, TaskOpCancel)
 	if err != nil {
 		return err
 	}

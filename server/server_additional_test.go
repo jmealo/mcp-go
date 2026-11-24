@@ -1020,10 +1020,10 @@ func TestToolResultSizeLimitOnTasks(t *testing.T) {
 			require.True(t, ok)
 
 			require.Eventually(t, func() bool {
-				task, _, err := server.getTask(ctx, created.Task.TaskId)
+				task, _, err := server.getTask(ctx, created.Task.TaskId, TaskOpGet)
 				return err == nil && task.Status.IsTerminal()
 			}, 5*time.Second, 10*time.Millisecond)
-			task, _, err := server.getTask(ctx, created.Task.TaskId)
+			task, _, err := server.getTask(ctx, created.Task.TaskId, TaskOpGet)
 			require.NoError(t, err)
 			require.Equal(t, mcp.TaskStatusCompleted, task.Status)
 

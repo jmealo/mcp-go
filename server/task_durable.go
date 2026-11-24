@@ -157,6 +157,7 @@ func (s *MCPServer) recordFromEntryLocked(entry *taskEntry) TaskRecord {
 		InputRequests:      maps.Clone(entry.inputRequests),
 		DeliveredInputKeys: keys,
 		Owner:              owner,
+		OwnerID:            entry.ownerID,
 		Revision:           entry.loadRevision(),
 	})
 }
@@ -393,6 +394,7 @@ func hydrateEntry(rec TaskRecord) *taskEntry {
 		resumeState:     rec.ResumeState,
 		inputRequests:   rec.InputRequests,
 		owner:           rec.Owner,
+		ownerID:         rec.OwnerID,
 		remote:          true,
 		createdHookDone: true,
 		done:            make(chan struct{}),
