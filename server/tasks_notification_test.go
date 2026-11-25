@@ -88,6 +88,12 @@ func TestSubscriptionsListen_TaskIDsEchoedInAck(t *testing.T) {
 func TestTaskNotifications_PushedToSubscribers(t *testing.T) {
 	srv := NewMCPServer("push-test", "1.0.0", WithTaskCapabilities(true, true, true))
 
+	// The task must exist before subscribing: unknown IDs are dropped from
+	// the acknowledged filter.
+	modernCtx := buildModernContext(t.Context(), srv)
+	entry, err := srv.createTask(modernCtx, "push-task", "deploy", nil, nil)
+	require.NoError(t, err)
+
 	subscriber, stop := subscribeToTask(t, srv, "push-task")
 	defer stop()
 
@@ -97,10 +103,6 @@ func TestTaskNotifications_PushedToSubscribers(t *testing.T) {
 	bystander := newListenSession()
 	srv.registerListenSession(bystander)
 	defer srv.unregisterListenSession(bystander)
-
-	modernCtx := buildModernContext(t.Context(), srv)
-	entry, err := srv.createTask(modernCtx, "push-task", "deploy", nil, nil)
-	require.NoError(t, err)
 
 	requests := mcp.InputRequests{
 		"confirm": mcp.NewElicitationInputRequest(mcp.ElicitationParams{

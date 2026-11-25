@@ -97,6 +97,30 @@ func (s *MCPServer) handleSubscriptionsListen(
 
 	allowed := s.allowedSubscriptions(request.Params.Notifications)
 
+	// Task subscriptions are narrowed to IDs the caller may actually
+	// observe: the task must exist here or in the store, and pass the task
+	// authorizer (which includes era and session isolation). Unknown and
+	// unauthorized IDs are dropped from the acknowledged filter, which the
+	// specification allows the server to narrow.
+	if len(allowed.TaskIds) > 0 {
+		allowed.TaskIds = s.resolveTaskSubscriptions(ctx, allowed.TaskIds)
+	}
+
+	// Per-caller cap on concurrent task-notification streams.
+	var releaseStream func()
+	if len(allowed.TaskIds) > 0 {
+		var err error
+		releaseStream, err = s.acquireTaskListenStream(s.taskStreamKey(ctx, session))
+		if err != nil {
+			return nil, &requestError{
+				id:   id,
+				code: mcp.INVALID_PARAMS,
+				err:  err,
+			}
+		}
+		defer releaseStream()
+	}
+
 	// Record the filter so notification fan-out can honour the opt-in.
 	if filtered, ok := session.(SessionWithSubscriptionFilter); ok {
 		filtered.SetSubscriptionFilter(allowed)
@@ -158,7 +182,37 @@ func (s *MCPServer) handleSubscriptionsListen(
 
 	// Hold the stream open for as long as anything was subscribed. When the
 	// filter is empty there is nothing to deliver, so close immediately.
-	if !allowed.IsEmpty() {
+	if len(allowed.TaskIds) > 0 {
+		listener := &taskStreamListener{
+			session:  session,
+			finished: make(map[string]chan struct{}),
+		}
+		for _, taskID := range allowed.TaskIds {
+			listener.finished[taskID] = make(chan struct{})
+		}
+		s.taskListeners.register(allowed.TaskIds, listener)
+		defer s.taskListeners.unregister(listener)
+
+		watchCtx := ctx
+		var cancelWatch context.CancelFunc
+		if s.taskListenMaxLifetime > 0 {
+			watchCtx, cancelWatch = context.WithTimeout(ctx, s.taskListenMaxLifetime)
+			defer cancelWatch()
+		}
+
+		// The stream ends when the client disconnects, the lifetime elapses,
+		// or every acknowledged task is terminal with its final notification
+		// delivered (or has expired).
+		done := make(chan struct{})
+		go func() {
+			s.watchTaskStream(watchCtx, listener)
+			close(done)
+		}()
+		select {
+		case <-ctx.Done():
+		case <-done:
+		}
+	} else if !allowed.IsEmpty() {
 		<-ctx.Done()
 	}
 

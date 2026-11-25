@@ -306,10 +306,15 @@ type MCPServer struct {
 	hooks                        *Hooks
 	taskHooks                    *TaskHooks
 	tasks                        map[string]*taskEntry
-	taskStore                    TaskStore          // nil: tasks live only in this process
-	taskOwner                    string             // this server's Owner in task records
-	taskOwnerIDFn                TaskOwnerFunc      // records the creating caller's identity on tasks
-	taskAuthorizer               TaskAuthorizerFunc // gates task operations after decode+load
+	taskStore                    TaskStore            // nil: tasks live only in this process
+	taskOwner                    string               // this server's Owner in task records
+	taskOwnerIDFn                TaskOwnerFunc        // records the creating caller's identity on tasks
+	taskAuthorizer               TaskAuthorizerFunc   // gates task operations after decode+load
+	taskListeners                taskListenerRegistry // task notification streams, indexed by task ID
+	taskListenMu                 sync.Mutex           // guards taskListenStreams
+	taskListenStreams            map[string]int       // active task listen streams per caller key
+	maxTaskListenStreams         int                  // per-caller cap; 0 disables
+	taskListenMaxLifetime        time.Duration        // max task listen stream duration; 0 disables
 	taskStoreRetryMin            time.Duration
 	taskStoreRetryMax            time.Duration
 	taskPurgeInterval            time.Duration
@@ -874,6 +879,8 @@ func NewMCPServer(
 		promptHandlerMiddlewares:   make([]PromptHandlerMiddleware, 0),
 		name:                       name,
 		version:                    version,
+		taskListeners:              taskListenerRegistry{byTask: make(map[string]map[*taskStreamListener]struct{})},
+		taskListenStreams:          make(map[string]int),
 		notificationHandlers:       make(map[string]NotificationHandlerFunc),
 		tasks:                      make(map[string]*taskEntry),
 		expiredTasks:               make(map[string]time.Time),

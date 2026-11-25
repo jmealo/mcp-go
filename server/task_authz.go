@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 )
 
 // TaskOp names the operation a task authorization decision is made for.
@@ -73,4 +75,31 @@ func (s *MCPServer) authorizeTask(ctx context.Context, op TaskOp, entry *taskEnt
 		return fmt.Errorf("task not found")
 	}
 	return nil
+}
+
+// errTooManyTaskListenStreams refuses a stream over the per-caller cap.
+var errTooManyTaskListenStreams = errors.New("task listen stream limit reached for this caller")
+
+// WithMaxTaskListenStreams caps the concurrent subscriptions/listen streams
+// that carry task notifications, counted per caller: the WithTaskOwner
+// identity when configured, otherwise the session. A caller over the cap
+// has its stream refused with INVALID_PARAMS. Zero (the default) disables
+// the cap.
+func WithMaxTaskListenStreams(n int) ServerOption {
+	return func(s *MCPServer) {
+		if n > 0 {
+			s.maxTaskListenStreams = n
+		}
+	}
+}
+
+// WithTaskListenMaxLifetime bounds how long a task-notification listen
+// stream may run; the stream then closes and the client may re-subscribe.
+// Zero (the default) disables the bound.
+func WithTaskListenMaxLifetime(d time.Duration) ServerOption {
+	return func(s *MCPServer) {
+		if d > 0 {
+			s.taskListenMaxLifetime = d
+		}
+	}
 }

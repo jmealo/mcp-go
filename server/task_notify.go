@@ -89,33 +89,8 @@ func (s *MCPServer) notifyTaskSubscribers(entry *taskEntry) {
 	}
 	notification.Params = params
 
-	taskID := entry.task.TaskId
-
-	deliver := func(session any) {
-		filtered, ok := session.(SessionWithSubscriptionFilter)
-		if !ok {
-			return
-		}
-		filter, active := filtered.SubscriptionFilter()
-		if !active {
-			return
-		}
-		for _, subscribed := range filter.TaskIds {
-			if subscribed == taskID {
-				// Error is dropped: a blocked channel must not stall task
-				// execution, and the poll path remains available.
-				_ = s.sendNotificationToSpecificClient(filtered, notification)
-				return
-			}
-		}
-	}
-
-	s.sessions.Range(func(_, value any) bool {
-		deliver(value)
-		return true
-	})
-	s.listenSessions.Range(func(_, value any) bool {
-		deliver(value)
-		return true
-	})
+	// Indexed fan-out: only the streams subscribed to this task, and a
+	// terminal transition finishes the task on each stream after the
+	// delivery attempt.
+	s.notifyTaskListeners(entry.task.TaskId, notification, entry.task.Status.IsTerminal())
 }
