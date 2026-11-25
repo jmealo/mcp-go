@@ -3985,7 +3985,15 @@ func (s *MCPServer) sendTaskStatusNotification(entry *taskEntry) {
 		taskMap["pollIntervalMs"] = *task.PollInterval // SEP-2663 field name
 	}
 
-	s.SendNotificationToAllClients(mcp.MethodNotificationTasksStatus, taskMap)
+	// The 2025-11-25 specification sends notifications/tasks/status "to
+	// inform the requestor of the change" - the session that created the
+	// task. Broadcasting it to every session leaks a bearer-handle task ID
+	// (and its state) to callers that never demonstrated knowledge of it,
+	// the exposure its Security Considerations require binding against. A
+	// session-less task has no requestor session to inform.
+	if entry.sessionID != "" {
+		_ = s.SendNotificationToSpecificClient(entry.sessionID, mcp.MethodNotificationTasksStatus, taskMap)
+	}
 }
 
 // getSessionID extracts the session ID from the context.
