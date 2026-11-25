@@ -3962,7 +3962,12 @@ func (s *MCPServer) sendTaskStatusNotification(entry *taskEntry) {
 		s.notifyTaskSubscribers(entry)
 		return
 	}
+	// Copy the task under the lock: the caller invokes this after its own
+	// critical section, and a concurrent cancel or completion may mutate
+	// entry.task meanwhile.
+	s.tasksMu.RLock()
 	task := entry.task
+	s.tasksMu.RUnlock()
 
 	// Convert task to map[string]any for notification params
 	taskMap := map[string]any{

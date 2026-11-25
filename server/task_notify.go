@@ -91,6 +91,8 @@ func (s *MCPServer) notifyTaskSubscribers(entry *taskEntry) {
 
 	// Indexed fan-out: only the streams subscribed to this task, and a
 	// terminal transition finishes the task on each stream after the
-	// delivery attempt.
-	s.notifyTaskListeners(entry.task.TaskId, notification, entry.task.Status.IsTerminal())
+	// delivery attempt. The task ID and status come from the locked
+	// snapshot above: reading entry.task here would race the cancel and
+	// completion paths, which mutate it after their locks drop.
+	s.notifyTaskListeners(result.Task.TaskId, notification, result.Task.Status.IsTerminal())
 }

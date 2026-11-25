@@ -923,7 +923,9 @@ func TestMCPServer_TaskStatusNotifications(t *testing.T) {
 		WithTaskCapabilities(true, true, true),
 	)
 
-	// Create a session to receive notifications
+	// Create a session to receive notifications. Tasks are created on the
+	// session's context: notifications/tasks/status is delivered to the
+	// creating session, not broadcast.
 	ctx := t.Context()
 	notifyChan := make(chan mcp.JSONRPCNotification, 10)
 	session := fakeSess{
@@ -932,6 +934,7 @@ func TestMCPServer_TaskStatusNotifications(t *testing.T) {
 	}
 	err := server.RegisterSession(ctx, session)
 	require.NoError(t, err)
+	ctx = server.WithContext(ctx, session)
 
 	t.Run("task completion sends notification", func(t *testing.T) {
 		// Create a task
@@ -1095,8 +1098,8 @@ func TestMCPServer_TaskStatusNotifications(t *testing.T) {
 		}
 	})
 
-	t.Run("multiple clients receive notifications", func(t *testing.T) {
-		// Create two additional sessions
+	t.Run("only the creating session is notified", func(t *testing.T) {
+		// Two further sessions; the task belongs to the first.
 		notifyChan1 := make(chan mcp.JSONRPCNotification, 10)
 		session1 := fakeSess{
 			sessionID:  "test-session-1",
@@ -1113,8 +1116,8 @@ func TestMCPServer_TaskStatusNotifications(t *testing.T) {
 		err = server.RegisterSession(ctx, session2)
 		require.NoError(t, err)
 
-		// Create a task
-		entry, err := server.createTask(ctx, "task-notify-multi", "test-tool", nil, nil)
+		// Create a task on session1's context.
+		entry, err := server.createTask(server.WithContext(ctx, session1), "task-notify-multi", "test-tool", nil, nil)
 		require.NoError(t, err)
 
 		// Clear any initial notifications
@@ -1128,7 +1131,7 @@ func TestMCPServer_TaskStatusNotifications(t *testing.T) {
 		// Complete the task
 		server.completeTask(entry, "result", nil)
 
-		// Both sessions should receive notification
+		// The creating session is informed...
 		select {
 		case notification := <-notifyChan1:
 			assert.Equal(t, mcp.MethodNotificationTasksStatus, notification.Method)
@@ -1136,11 +1139,12 @@ func TestMCPServer_TaskStatusNotifications(t *testing.T) {
 			t.Fatal("Expected notification on session1")
 		}
 
+		// ...and the other session, which never created the task, is not:
+		// the task ID is a bearer handle its holder never demonstrated.
 		select {
 		case notification := <-notifyChan2:
-			assert.Equal(t, mcp.MethodNotificationTasksStatus, notification.Method)
-		case <-time.After(1 * time.Second):
-			t.Fatal("Expected notification on session2")
+			t.Fatalf("session2 received %q for a task it did not create", notification.Method)
+		default:
 		}
 	})
 

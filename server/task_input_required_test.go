@@ -640,8 +640,10 @@ func TestModernTaskStatusNotSentToOtherSessions(t *testing.T) {
 		// No broadcast — correct.
 	}
 
-	// A legacy task still broadcasts.
-	legacyEntry, err := srv.createTask(t.Context(), "legacy-task", "tool", &ttl, nil)
+	// A legacy task notifies the session that created it. The observer
+	// session creates this one, so it is informed.
+	observer := fakeSess{sessionID: "observer", notifyChan: notifyChan}
+	legacyEntry, err := srv.createTask(srv.WithContext(t.Context(), observer), "legacy-task", "tool", &ttl, nil)
 	require.NoError(t, err)
 	srv.completeTask(legacyEntry, &mcp.CallToolResult{
 		Content: []mcp.Content{mcp.NewTextContent("ok")},
