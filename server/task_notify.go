@@ -114,8 +114,8 @@ func (s *MCPServer) notifyTaskSubscribers(entry *taskEntry) {
 		deliver(value)
 		return true
 	})
-	s.listenSessions.Range(func(_, value any) bool {
-		deliver(value)
+	s.listenSessions.Range(func(key, _ any) bool {
+		deliver(key)
 		return true
 	})
 }
